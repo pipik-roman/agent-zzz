@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const pkg = require('../package.json');
-const { sleepSystem, state } = require('../src/index');
+const { formatLocalTimestamp, sleepSystem, state } = require('../src/index');
 
 /**
  * Parses CLI flags into an options object.
@@ -135,7 +135,7 @@ async function main() {
     }
 
     process.on('SIGINT', () => {
-        console.log('\nSleep aborted by user.');
+        console.log(`\n[${formatLocalTimestamp(new Date(), true)}] Sleep aborted by user.`);
         process.exit(130);
     });
 

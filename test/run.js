@@ -5,7 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 
 const { parseArgs } = require('../bin/agent-zzz');
-const { telemetry, power, state } = require('../src/index');
+const { formatLocalTimestamp, formatAuditReport, waitForIdle, telemetry, power, state } = require('../src/index');
 
 test('parseArgs parses defaults and custom flags cleanly', () => {
     const defaults = parseArgs([]);
@@ -432,6 +432,85 @@ test('telemetry prevents cross-transcript task ID leakage and respects manage_ta
             nowMs: t1.getTime() + 25 * 1000
         });
         assert.equal(active.length, 0);
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('formatLocalTimestamp and formatAuditReport include wall-clock timestamps and activity details', () => {
+    const sample = new Date(2026, 10, 9, 6, 43, 5);
+    assert.equal(formatLocalTimestamp(sample), '06:43:05');
+    assert.equal(formatLocalTimestamp(sample, true), '2026-11-09 06:43:05');
+
+    const report = formatAuditReport({
+        checkedAt: sample.toISOString(),
+        excludedSessionId: null,
+        activeSessions: [
+            {
+                harness: 'antigravity',
+                shortId: '71f654cf',
+                topic: 'Implement WorkInventoryRegistry',
+                step: 150,
+                state: 'running background task "task-149"',
+                ageSec: 12,
+                lastActivityAt: new Date(sample.getTime() - 12 * 1000).toISOString()
+            }
+        ],
+        sleepStates: { available: false, states: [] },
+        powerAudit: { message: 'Skipped.', locks: [] }
+    });
+
+    assert.match(report, /^\[2026-11-09 06:43:05\] Agent-zzz telemetry audit:/m);
+    assert.match(report, /step 150, running background task "task-149", 12s ago @ 06:42:53/);
+});
+
+test('waitForIdle logs wall-clock timestamps, step progress, and freshness across polling', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-wait-ts-'));
+    try {
+        const sessId = '71f654cf-wait-ts';
+        const logDir = path.join(tmpRoot, 'brain', sessId, '.system_generated', 'logs');
+        fs.mkdirSync(logDir, { recursive: true });
+
+        const transcriptPath = path.join(logDir, 'transcript.jsonl');
+        fs.writeFileSync(transcriptPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>Wait test</USER_REQUEST>' }),
+            JSON.stringify({ step_index: 42, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command' }] })
+        ].join('\n'));
+
+        const logs = [];
+        let polls = 0;
+        const origFind = telemetry.findActiveSessions;
+        telemetry.findActiveSessions = () => {
+            polls++;
+            if (polls <= 2) {
+                return [{
+                    harness: 'antigravity',
+                    id: sessId,
+                    shortId: '71f654cf',
+                    step: 41 + polls,
+                    ageSec: 2,
+                    lastActivityAt: new Date().toISOString(),
+                    state: 'running tool "run_command"',
+                    topic: 'Wait test'
+                }];
+            }
+            return [];
+        };
+
+        try {
+            const res = await waitForIdle(
+                { appDataDir: tmpRoot, pollIntervalSeconds: 0.02, timeoutMinutes: 1 },
+                (line) => logs.push(line)
+            );
+            assert.equal(res.ready, true);
+        } finally {
+            telemetry.findActiveSessions = origFind;
+        }
+
+        const joined = logs.join('\n');
+        assert.match(joined, /\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] Detected 1 active agent session\(s\)/);
+        assert.match(joined, /\[\d{2}:\d{2}:\d{2}\] \[\+\d+s\] Still waiting on: 71f654cf \(step 43, running tool "run_command", 2s ago\)/);
+        assert.match(joined, /\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] All external agent sessions have settled into idle\./);
     } finally {
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

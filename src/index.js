@@ -3,6 +3,21 @@ const power = require('./power');
 const state = require('./state');
 
 /**
+ * Formats a Date into local wall-clock timestamp (`HH:MM:SS` or `YYYY-MM-DD HH:MM:SS`).
+ * Helps correlate agent transitions and sleep events against IDE and terminal logs.
+ * @param {Date|string|number} [input]
+ * @param {boolean} [includeDate]
+ * @returns {string}
+ */
+function formatLocalTimestamp(input = new Date(), includeDate = false) {
+    const date = input instanceof Date ? input : new Date(input);
+    const pad = (n) => String(n).padStart(2, '0');
+    const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    if (!includeDate) return time;
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`;
+}
+
+/**
  * Non-blocking sleep helper for async polling and countdowns.
  * Allows clean Ctrl+C / SIGINT interruption with zero CPU spin.
  * @param {number} ms
@@ -25,6 +40,7 @@ function checkStatus(options = {}) {
     const lastLatch = state.readStateLatch(options);
 
     return {
+        checkedAt: new Date().toISOString(),
         readyToSleep: activeSessions.length === 0,
         excludedSessionId: excludedSessionId || null,
         activeSessions,
@@ -41,6 +57,8 @@ function checkStatus(options = {}) {
  */
 function formatAuditReport(audit) {
     const lines = [];
+    const stamp = formatLocalTimestamp(audit.checkedAt || new Date(), true);
+    lines.push(`[${stamp}] Agent-zzz telemetry audit:`);
 
     if (audit.excludedSessionId) {
         lines.push(`Self-exclusion active: ignoring session [${audit.excludedSessionId.slice(0, 8)}]`);
@@ -51,7 +69,8 @@ function formatAuditReport(audit) {
     } else {
         lines.push(`Agent sessions: ${audit.activeSessions.length} active session(s) detected:`);
         for (const s of audit.activeSessions) {
-            lines.push(`  - [${s.harness}:${s.shortId}] "${s.topic}" (step ${s.step}, ${s.state}, ${s.ageSec}s ago)`);
+            const atTime = s.lastActivityAt ? ` @ ${formatLocalTimestamp(s.lastActivityAt)}` : '';
+            lines.push(`  - [${s.harness}:${s.shortId}] "${s.topic}" (step ${s.step}, ${s.state}, ${s.ageSec}s ago${atTime})`);
         }
     }
 
@@ -86,12 +105,13 @@ async function waitForIdle(options = {}, logFn = console.log) {
 
     let active = telemetry.findActiveSessions(options);
     if (active.length === 0) {
-        return { ready: true, message: 'All external agent sessions are idle.' };
+        return { ready: true, message: `[${formatLocalTimestamp(new Date(), true)}] All external agent sessions are idle.` };
     }
 
-    logFn(`\nDetected ${active.length} active agent session(s) in progress:`);
+    logFn(`\n[${formatLocalTimestamp(new Date(), true)}] Detected ${active.length} active agent session(s) in progress:`);
     for (const s of active) {
-        logFn(`  - [${s.harness}:${s.shortId}] "${s.topic}" (step ${s.step}, ${s.state}, active ${s.ageSec}s ago)`);
+        const atTime = s.lastActivityAt ? ` @ ${formatLocalTimestamp(s.lastActivityAt)}` : '';
+        logFn(`  - [${s.harness}:${s.shortId}] "${s.topic}" (step ${s.step}, ${s.state}, active ${s.ageSec}s ago${atTime})`);
     }
     logFn('Waiting for active turns and tools to complete before sleeping... (Pass --now to bypass)\n');
 
@@ -99,7 +119,7 @@ async function waitForIdle(options = {}, logFn = console.log) {
         if (timeoutMs > 0 && (Date.now() - startTime) > timeoutMs) {
             return {
                 ready: false,
-                message: `Timed out after ${timeoutMinutes}m waiting for ${active.length} active session(s) to finish.`
+                message: `[${formatLocalTimestamp(new Date(), true)}] Timed out after ${timeoutMinutes}m waiting for ${active.length} active session(s) to finish.`
             };
         }
 
@@ -108,12 +128,12 @@ async function waitForIdle(options = {}, logFn = console.log) {
         active = telemetry.findActiveSessions(options);
         if (active.length > 0) {
             const elapsedSec = Math.round((Date.now() - startTime) / 1000);
-            const summary = active.map((s) => `${s.shortId} (${s.state})`).join(', ');
-            logFn(`[+${elapsedSec}s] Still waiting on: ${summary}`);
+            const summary = active.map((s) => `${s.shortId} (step ${s.step}, ${s.state}, ${s.ageSec}s ago)`).join(', ');
+            logFn(`[${formatLocalTimestamp()}] [+${elapsedSec}s] Still waiting on: ${summary}`);
         }
     }
 
-    logFn('All external agent sessions have settled into idle.');
+    logFn(`[${formatLocalTimestamp(new Date(), true)}] All external agent sessions have settled into idle.`);
     return { ready: true, message: 'All external agent sessions are idle.' };
 }
 
@@ -128,7 +148,7 @@ async function waitForIdle(options = {}, logFn = console.log) {
 async function runGraceCountdown(delaySeconds, mode, logFn = console.log) {
     if (delaySeconds <= 0) return;
 
-    logFn(`\nSystem will enter ${mode} in ${delaySeconds} second(s). Press Ctrl+C to abort.`);
+    logFn(`\n[${formatLocalTimestamp(new Date(), true)}] System will enter ${mode} in ${delaySeconds} second(s). Press Ctrl+C to abort.`);
 
     let remaining = delaySeconds;
     while (remaining > 0) {
@@ -138,7 +158,7 @@ async function runGraceCountdown(delaySeconds, mode, logFn = console.log) {
         remaining -= waitSec;
 
         if (remaining > 0) {
-            logFn(`  ... ${remaining}s remaining before ${mode}`);
+            logFn(`  [${formatLocalTimestamp()}] ... ${remaining}s remaining before ${mode}`);
         }
     }
 }
@@ -180,7 +200,7 @@ async function sleepSystem(options = {}) {
     // Refresh OS power lock audit after sessions settle
     const finalAudit = checkStatus(options);
     if (finalAudit.powerAudit && finalAudit.powerAudit.locks.length > 0) {
-        logFn(`\nWarning: ${finalAudit.powerAudit.message}`);
+        logFn(`\n[${formatLocalTimestamp()}] Warning: ${finalAudit.powerAudit.message}`);
         for (const lock of finalAudit.powerAudit.locks) {
             logFn(`  - [${lock.category}] ${lock.entry}`);
         }
@@ -190,7 +210,7 @@ async function sleepSystem(options = {}) {
             return {
                 success: false,
                 audit: finalAudit,
-                message: 'Sleep aborted due to active OS wake locks (--no-force specified).'
+                message: `[${formatLocalTimestamp(new Date(), true)}] Sleep aborted due to active OS wake locks (--no-force specified).`
             };
         }
     }
@@ -222,6 +242,8 @@ async function sleepSystem(options = {}) {
         invokingSessionId: finalAudit.excludedSessionId
     }, options);
 
+    logFn(`[${formatLocalTimestamp(new Date(), true)}] Triggering OS ${mode} now...`);
+
     // Trigger OS sleep
     const suspendRes = power.executeSuspend(options);
 
@@ -232,11 +254,13 @@ async function sleepSystem(options = {}) {
 
     return {
         ...suspendRes,
+        message: `[${formatLocalTimestamp(new Date(), true)}] ${suspendRes.message}`,
         audit: finalAudit
     };
 }
 
 module.exports = {
+    formatLocalTimestamp,
     sleepAsync,
     checkStatus,
     formatAuditReport,

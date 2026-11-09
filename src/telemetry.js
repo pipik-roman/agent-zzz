@@ -433,12 +433,21 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
     }
 
     let ageSec = transcriptAgeSec;
+    let lastActivityMs = stat.mtimeMs;
     if (activeTaskLogs.length > 0) {
         ageSec = Math.min(ageSec, activeTaskLogs[0].ageSec);
+        const topLogMs = logMtimeByName.get(activeTaskLogs[0].fileName);
+        if (topLogMs && topLogMs > lastActivityMs) {
+            lastActivityMs = topLogMs;
+        }
     }
     for (const t of activeOpenTasks) {
         if (t.logAgeSec !== null) {
             ageSec = Math.min(ageSec, t.logAgeSec);
+            const taskLogMs = logMtimeByName.get(t.logFile);
+            if (taskLogMs && taskLogMs > lastActivityMs) {
+                lastActivityMs = taskLogMs;
+            }
         }
     }
 
@@ -448,6 +457,7 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
         shortId: convId.slice(0, 8),
         step: last.step_index || 0,
         ageSec,
+        lastActivityAt: new Date(lastActivityMs).toISOString(),
         state,
         tool: toolName,
         topic

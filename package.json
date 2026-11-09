@@ -1,0 +1,42 @@
+{
+  "name": "agent-zzz",
+  "version": "0.1.0",
+  "description": "Safe, agent-aware PC sleep and hardware power management for autonomous coding agents.",
+  "main": "src/index.js",
+  "bin": {
+    "agent-zzz": "bin/agent-zzz.js",
+    "zzz": "bin/agent-zzz.js"
+  },
+  "scripts": {
+    "test": "node --test test/run.js",
+    "check": "node bin/agent-zzz.js --check-only",
+    "dry-run": "node bin/agent-zzz.js --dry-run"
+  },
+  "keywords": [
+    "agent",
+    "ai",
+    "sleep",
+    "power",
+    "antigravity",
+    "claude-code",
+    "cursor",
+    "standby",
+    "suspend",
+    "hibernate",
+    "pc-sleep",
+    "powercfg"
+  ],
+  "author": "Roman Pipík <roman.pipik@dominanz.sk>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipik-roman/agent-zzz.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pipik-roman/agent-zzz/issues"
+  },
+  "homepage": "https://github.com/pipik-roman/agent-zzz#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

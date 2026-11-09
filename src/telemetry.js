@@ -6,7 +6,9 @@ const PASSIVE_TIMER_REGEX = /^(?:Timer|Cron|Schedule)\s*:/i;
 const TASK_START_ID_REGEX = /^Tool is running as a background task with task id:\s*([^\s\r\n]+)/im;
 const TASK_DESCRIPTION_REGEX = /^Task Description:\s*([^\r\n]+)/im;
 const TASK_LOG_PATH_REGEX = /^Task logs are available at:\s*[^\r\n]*[/\\]([^/\r\n]+\.log)/im;
-const TASK_FINISHED_REGEX = /Task id\s+["']?([^\s"']+)["']?\s+(?:finished|completed|failed|cancelled|canceled|killed|exited|stopped)\b/gi;
+const TASK_FINISHED_REGEX = /Task id\s+["']?([^\s"']+)["']?\s+(?:was\s+)?(finished|completed|failed|cancelled|canceled|killed|exited|stopped)\b/gi;
+const TASK_CANCELED_OUTCOME_REGEX = /^(?:cancelled|canceled|killed)$/i;
+const FORCE_STOP_NOTICE_REGEX = /\[Notice\]\s*All your subagents and background tasks have been stopped\b/i;
 const MANAGE_TASK_TERMINAL_REGEX = /^Task:\s*([^\s\r\n]+)\r?\nStatus:\s*(DONE|COMPLETED|FINISHED|KILLED|CANCELL?ED|FAILED|ERROR)\b/gim;
 
 /**
@@ -198,7 +200,7 @@ function belongsToConversation(taskId, convId) {
  * @param {Array<Object>} entries
  * @param {number} fallbackTimestampMs
  * @param {string} [convId]
- * @returns {{ openTasks: Map<string, Object>, completedTasks: Map<string, Object>, completedByLog: Map<string, number>, passiveTimerLogs: Set<string> }}
+ * @returns {{ openTasks: Map<string, Object>, completedTasks: Map<string, Object>, completedByLog: Map<string, number>, passiveTimerIds: Set<string>, passiveTimerLogs: Set<string> }}
  */
 function extractBackgroundTaskState(entries, fallbackTimestampMs, convId = '') {
     const openTasks = new Map();
@@ -239,20 +241,28 @@ function extractBackgroundTaskState(entries, fallbackTimestampMs, convId = '') {
             }
         }
 
-        // 2. Detect completion via SYSTEM_MESSAGE notification
+        // 2. Detect completion or cancellation via SYSTEM_MESSAGE notification
         TASK_FINISHED_REGEX.lastIndex = 0;
         let finishMatch;
         while ((finishMatch = TASK_FINISHED_REGEX.exec(content)) !== null) {
             const closedId = finishMatch[1];
             if (!belongsToConversation(closedId, convId)) continue;
 
+            const outcome = (finishMatch[2] || '').toLowerCase();
+            const canceled = TASK_CANCELED_OUTCOME_REGEX.test(outcome);
             const existing = openTasks.get(closedId);
             const shortId = closedId.includes('/') ? closedId.split('/').pop() : closedId;
             const logFile = existing ? existing.logFile : `${shortId}.log`;
 
             openTasks.delete(closedId);
             if (!passiveTimerIds.has(closedId)) {
-                completedTasks.set(closedId, { id: closedId, logFile, completedAtMs: entryMs });
+                const prev = completedTasks.get(closedId);
+                completedTasks.set(closedId, {
+                    id: closedId,
+                    logFile,
+                    completedAtMs: prev ? Math.max(prev.completedAtMs, entryMs) : entryMs,
+                    canceled: canceled || !!(prev && prev.canceled)
+                });
                 completedByLog.set(logFile, Math.max(completedByLog.get(logFile) || 0, entryMs));
             }
         }
@@ -264,13 +274,21 @@ function extractBackgroundTaskState(entries, fallbackTimestampMs, convId = '') {
             const closedId = manageMatch[1];
             if (!belongsToConversation(closedId, convId)) continue;
 
+            const outcome = (manageMatch[2] || '').toLowerCase();
+            const canceled = /^(?:killed|cancell?ed)$/i.test(outcome);
             const existing = openTasks.get(closedId);
             const shortId = closedId.includes('/') ? closedId.split('/').pop() : closedId;
             const logFile = existing ? existing.logFile : `${shortId}.log`;
 
             openTasks.delete(closedId);
             if (!passiveTimerIds.has(closedId)) {
-                completedTasks.set(closedId, { id: closedId, logFile, completedAtMs: entryMs });
+                const prev = completedTasks.get(closedId);
+                completedTasks.set(closedId, {
+                    id: closedId,
+                    logFile,
+                    completedAtMs: prev ? Math.max(prev.completedAtMs, entryMs) : entryMs,
+                    canceled: canceled || !!(prev && prev.canceled)
+                });
                 completedByLog.set(logFile, Math.max(completedByLog.get(logFile) || 0, entryMs));
             }
         }
@@ -280,6 +298,7 @@ function extractBackgroundTaskState(entries, fallbackTimestampMs, convId = '') {
         openTasks,
         completedTasks,
         completedByLog,
+        passiveTimerIds,
         passiveTimerLogs
     };
 }
@@ -310,21 +329,150 @@ function readTaskLogFiles(tasksDir) {
 }
 
 /**
+ * Reads `.system_generated/messages/` to detect undelivered force-stop notices
+ * and per-task completion/cancellation receipts written outside `transcript.jsonl`.
+ * Antigravity freezes `transcript.jsonl` when a subagent or task is killed externally,
+ * recording the cancellation in `messages/*.json` and `messages/undelivered/*`.
+ * @param {string} messagesDir
+ * @param {string} [convId]
+ * @returns {{ unreadForceStopMs: number|null, latestForceStopMs: number|null, completedTasks: Array<{ id: string, shortId: string, logFile: string, completedAtMs: number, canceled: boolean }> }}
+ */
+function readMessageNotices(messagesDir, convId = '') {
+    const result = {
+        unreadForceStopMs: null,
+        latestForceStopMs: null,
+        completedTasks: []
+    };
+    if (!messagesDir || !fs.existsSync(messagesDir)) return result;
+
+    let readMap = {};
+    const readJsonPath = path.join(messagesDir, 'read.json');
+    try {
+        if (fs.existsSync(readJsonPath)) {
+            const parsed = JSON.parse(fs.readFileSync(readJsonPath, 'utf8'));
+            if (parsed && typeof parsed === 'object') {
+                readMap = parsed;
+            }
+        }
+    } catch (e) {
+        // Ignore malformed read.json
+    }
+
+    const undeliveredIds = new Set();
+    const undeliveredDir = path.join(messagesDir, 'undelivered');
+    try {
+        if (fs.existsSync(undeliveredDir)) {
+            for (const entry of fs.readdirSync(undeliveredDir, { withFileTypes: true })) {
+                if (entry.isFile()) {
+                    undeliveredIds.add(entry.name);
+                }
+            }
+        }
+    } catch (e) {
+        // Ignore unreadable undelivered directory
+    }
+
+    let items = [];
+    try {
+        items = fs.readdirSync(messagesDir, { withFileTypes: true });
+    } catch (e) {
+        return result;
+    }
+
+    for (const item of items) {
+        if (!item.isFile() || !item.name.toLowerCase().endsWith('.json') || item.name === 'read.json') {
+            continue;
+        }
+
+        const filePath = path.join(messagesDir, item.name);
+        let msg;
+        try {
+            msg = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        } catch (e) {
+            continue;
+        }
+        if (!msg || typeof msg !== 'object' || typeof msg.content !== 'string') continue;
+
+        const msgId = (typeof msg.id === 'string' && msg.id) ? msg.id : item.name.slice(0, -5);
+        const isUnread = undeliveredIds.has(msgId) || readMap[msgId] !== true;
+        const sender = typeof msg.sender === 'string' ? msg.sender.trim() : '';
+
+        let msgMs = parseTimestampMs(msg.timestamp);
+        if (msgMs === null) {
+            try {
+                msgMs = fs.statSync(filePath).mtimeMs;
+            } catch (e) {
+                msgMs = 0;
+            }
+        }
+
+        // System-level force cancellation stops all subagents and background tasks of this recipient session
+        const recipientMatches = !msg.recipient || !convId || msg.recipient === convId;
+        const isSystemSender = !sender || sender.toLowerCase() === 'system';
+        if (recipientMatches && isSystemSender && FORCE_STOP_NOTICE_REGEX.test(msg.content)) {
+            result.latestForceStopMs = result.latestForceStopMs === null
+                ? msgMs
+                : Math.max(result.latestForceStopMs, msgMs);
+            if (isUnread) {
+                result.unreadForceStopMs = result.unreadForceStopMs === null
+                    ? msgMs
+                    : Math.max(result.unreadForceStopMs, msgMs);
+            }
+        }
+
+        // Only inspect the first line (header) so task stdout text cannot spoof task completions
+        const firstLine = msg.content.split(/\r?\n/, 1)[0] || '';
+        TASK_FINISHED_REGEX.lastIndex = 0;
+        const finishMatch = TASK_FINISHED_REGEX.exec(firstLine);
+        if (finishMatch) {
+            const closedId = finishMatch[1];
+            const outcome = (finishMatch[2] || '').toLowerCase();
+            const senderMatchesTask = !sender || !sender.includes('/task-') || sender === closedId;
+            if (senderMatchesTask && belongsToConversation(closedId, convId)) {
+                const shortId = closedId.includes('/') ? closedId.split('/').pop() : closedId;
+                result.completedTasks.push({
+                    id: closedId,
+                    shortId,
+                    logFile: `${shortId}.log`,
+                    completedAtMs: msgMs,
+                    canceled: TASK_CANCELED_OUTCOME_REGEX.test(outcome)
+                });
+            }
+        }
+    }
+
+    return result;
+}
+
+/**
  * Evaluates whether a single Antigravity conversation is currently active.
- * Accounts for synchronous tool calls, open background tasks, live `.log` output,
- * context compaction checkpoints, pre-response model generation, and turn handoff buffers.
+ * Accounts for synchronous tool calls, approval waits, open background tasks, live `.log` output,
+ * `.system_generated/messages/` cancellations/force-stops, compaction checkpoints, and turn handoff buffers.
  * @param {Object} params
  * @param {string} params.convId
  * @param {string} params.transcriptPath
  * @param {string} params.tasksDir
+ * @param {string} [params.messagesDir]
  * @param {Object} [params.options]
  * @returns {Object|null}
  */
-function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options = {} }) {
+function inspectAntigravitySession({ convId, transcriptPath, tasksDir, messagesDir, options = {} }) {
     const now = typeof options.nowMs === 'number' ? options.nowMs : Date.now();
-    const maxAgeSec = typeof options.maxTranscriptAgeSec === 'number' ? options.maxTranscriptAgeSec : 900;
+    const legacyTranscriptAge = typeof options.maxTranscriptAgeSec === 'number' ? options.maxTranscriptAgeSec : null;
+    const maxToolAgeSec = typeof options.maxToolAgeSec === 'number'
+        ? options.maxToolAgeSec
+        : (legacyTranscriptAge !== null ? legacyTranscriptAge : 120);
+    const maxRunCommandAgeSec = typeof options.maxRunCommandAgeSec === 'number'
+        ? options.maxRunCommandAgeSec
+        : (legacyTranscriptAge !== null ? Math.min(legacyTranscriptAge, 45) : 45);
+    const maxApprovalAgeSec = typeof options.maxApprovalAgeSec === 'number'
+        ? options.maxApprovalAgeSec
+        : (legacyTranscriptAge !== null ? Math.min(legacyTranscriptAge, 45) : 45);
+    const maxRunningStatusAgeSec = typeof options.maxRunningStatusAgeSec === 'number'
+        ? options.maxRunningStatusAgeSec
+        : (legacyTranscriptAge !== null ? legacyTranscriptAge : 120);
     const maxThinkingAgeSec = typeof options.maxThinkingAgeSec === 'number' ? options.maxThinkingAgeSec : 300;
-    const maxBackgroundTaskAgeSec = typeof options.maxBackgroundTaskAgeSec === 'number' ? options.maxBackgroundTaskAgeSec : 1800;
+    const maxBackgroundTaskAgeSec = typeof options.maxBackgroundTaskAgeSec === 'number' ? options.maxBackgroundTaskAgeSec : 300;
     const recentTaskLogSec = typeof options.recentTaskLogSec === 'number' ? options.recentTaskLogSec : 30;
     const recentTouchSec = typeof options.recentTouchSec === 'number' ? options.recentTouchSec : 15;
     const maxTailBytes = typeof options.maxTailBytes === 'number' ? options.maxTailBytes : 262144;
@@ -336,10 +484,18 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
     if (transcriptAgeSec > 86400) return null;
 
     const taskLogFiles = readTaskLogFiles(tasksDir);
-    const hasFreshAnyLog = taskLogFiles.some((f) => Math.max(0, Math.round((now - f.mtimeMs) / 1000)) <= recentTaskLogSec);
-    const maxOverallAgeSec = Math.max(maxAgeSec, maxBackgroundTaskAgeSec);
+    const maxLogWatchSec = Math.max(recentTaskLogSec, maxBackgroundTaskAgeSec);
+    const hasPotentiallyLiveLog = taskLogFiles.some((f) => Math.max(0, Math.round((now - f.mtimeMs) / 1000)) <= maxLogWatchSec);
+    const maxOverallAgeSec = Math.max(
+        maxToolAgeSec,
+        maxRunCommandAgeSec,
+        maxApprovalAgeSec,
+        maxRunningStatusAgeSec,
+        maxThinkingAgeSec,
+        maxBackgroundTaskAgeSec
+    );
 
-    if (transcriptAgeSec > maxOverallAgeSec && !hasFreshAnyLog) {
+    if (transcriptAgeSec > maxOverallAgeSec && !hasPotentiallyLiveLog) {
         return null;
     }
 
@@ -348,6 +504,27 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
 
     const last = entries[entries.length - 1];
     const taskState = extractBackgroundTaskState(entries, stat.mtimeMs, convId);
+
+    const resolvedMessagesDir = messagesDir || path.join(path.dirname(path.dirname(transcriptPath)), 'messages');
+    const messageNotices = readMessageNotices(resolvedMessagesDir, convId);
+    for (const msgTask of messageNotices.completedTasks) {
+        if (taskState.passiveTimerIds.has(msgTask.id)) continue;
+        const open = taskState.openTasks.get(msgTask.id);
+        if (open && msgTask.completedAtMs > 0 && msgTask.completedAtMs < open.createdAtMs - 5000) {
+            continue;
+        }
+        taskState.openTasks.delete(msgTask.id);
+        const prev = taskState.completedTasks.get(msgTask.id);
+        const completedAtMs = prev ? Math.max(prev.completedAtMs, msgTask.completedAtMs) : msgTask.completedAtMs;
+        const logFile = open ? open.logFile : msgTask.logFile;
+        taskState.completedTasks.set(msgTask.id, {
+            id: msgTask.id,
+            logFile,
+            completedAtMs,
+            canceled: !!(msgTask.canceled || (prev && prev.canceled))
+        });
+        taskState.completedByLog.set(logFile, Math.max(taskState.completedByLog.get(logFile) || 0, completedAtMs));
+    }
 
     const logMtimeByName = new Map();
     const activeTaskLogs = [];
@@ -368,13 +545,35 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
     }
     activeTaskLogs.sort((a, b) => a.ageSec - b.ageSec);
 
+    // If session has an unread system force-stop notice and no newer turn or non-canceled log arrived, it is stopped/idle
+    if (messageNotices.unreadForceStopMs !== null) {
+        const lastCreatedMs = parseTimestampMs(last.created_at);
+        const revivedByTranscript = lastCreatedMs !== null
+            ? lastCreatedMs > messageNotices.unreadForceStopMs
+            : stat.mtimeMs > messageNotices.unreadForceStopMs + 5000;
+        const hasLogAfterForceStop = activeTaskLogs.some(
+            (l) => (logMtimeByName.get(l.fileName) || 0) > messageNotices.unreadForceStopMs + 5000
+        );
+        if (!revivedByTranscript && !hasLogAfterForceStop) {
+            return null;
+        }
+    }
+
     const activeOpenTasks = [];
     for (const task of taskState.openTasks.values()) {
         const taskAgeSec = Math.max(0, Math.round((now - task.createdAtMs) / 1000));
         const logMtimeMs = logMtimeByName.get(task.logFile);
         const logAgeSec = logMtimeMs !== undefined ? Math.max(0, Math.round((now - logMtimeMs) / 1000)) : null;
 
-        if (taskAgeSec <= maxBackgroundTaskAgeSec || (logAgeSec !== null && logAgeSec <= recentTaskLogSec)) {
+        // Tasks created before a force-stop notice were killed unless their log wrote actively afterward
+        if (messageNotices.latestForceStopMs !== null && task.createdAtMs <= messageNotices.latestForceStopMs) {
+            const logAfterForceStop = logMtimeMs !== undefined && logMtimeMs > messageNotices.latestForceStopMs + 5000;
+            if (!logAfterForceStop) continue;
+        }
+
+        // Keep streaming builds alive while log updates periodically; expire silent/orphaned tasks after maxBackgroundTaskAgeSec
+        const silentAgeSec = logAgeSec !== null ? Math.min(taskAgeSec, logAgeSec) : taskAgeSec;
+        if (silentAgeSec <= maxBackgroundTaskAgeSec || (logAgeSec !== null && logAgeSec <= recentTaskLogSec)) {
             activeOpenTasks.push({
                 ...task,
                 taskAgeSec,
@@ -383,14 +582,49 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
         }
     }
 
+    const toolCalls = (last.type === 'PLANNER_RESPONSE' && Array.isArray(last.tool_calls)) ? last.tool_calls : [];
+    const hasToolCalls = toolCalls.length > 0;
+    const isAskQuestion = hasToolCalls && toolCalls.every((tc) => tc && tc.name === 'ask_question');
+    const hasRunCommand = hasToolCalls && toolCalls.some((tc) => tc && tc.name === 'run_command');
+    const isApprovalArg = (tc) => {
+        if (!tc || !tc.args) return false;
+        const val = tc.args.BypassSandbox;
+        return val === true || val === 'true' || val === '"true"';
+    };
+    const approvalTool = hasToolCalls ? toolCalls.find(isApprovalArg) : null;
+    const needsApproval = !!approvalTool;
+
+    let effectiveToolMaxAgeSec = maxToolAgeSec;
+    if (needsApproval && hasRunCommand) {
+        effectiveToolMaxAgeSec = Math.min(maxRunCommandAgeSec, maxApprovalAgeSec);
+    } else if (needsApproval) {
+        effectiveToolMaxAgeSec = Math.min(maxToolAgeSec, maxApprovalAgeSec);
+    } else if (hasRunCommand) {
+        effectiveToolMaxAgeSec = maxRunCommandAgeSec;
+    }
+
+    const lastStartMatch = (last.type === 'GENERIC' && last.status === 'RUNNING' && typeof last.content === 'string')
+        ? last.content.match(TASK_START_ID_REGEX)
+        : null;
+    const lastTaskId = (lastStartMatch && belongsToConversation(lastStartMatch[1], convId)) ? lastStartMatch[1] : null;
+    const lastCompletedTask = lastTaskId ? taskState.completedTasks.get(lastTaskId) : null;
+    const isLastCompletedTask = !!lastCompletedTask;
+    const isLastCanceledTask = !!(lastCompletedTask && lastCompletedTask.canceled);
+    const isLastForceStopSystemMsg = last.type === 'SYSTEM_MESSAGE'
+        && typeof last.content === 'string'
+        && /sender\s*=\s*system\b/i.test(last.content)
+        && FORCE_STOP_NOTICE_REGEX.test(last.content);
+
     const isPassiveLastTimer = isPassiveTimerEntry(last);
-    const isToolRunning = last.type === 'PLANNER_RESPONSE'
-        && Array.isArray(last.tool_calls)
-        && last.tool_calls.length > 0
-        && transcriptAgeSec <= maxAgeSec;
+    const isToolRunning = hasToolCalls
+        && !isAskQuestion
+        && transcriptAgeSec <= effectiveToolMaxAgeSec;
     const isRunningStatus = last.status === 'RUNNING'
-        && (!isPassiveLastTimer || transcriptAgeSec < recentTouchSec)
-        && transcriptAgeSec <= maxAgeSec;
+        && !isPassiveLastTimer
+        && !isAskQuestion
+        && !isLastCompletedTask
+        && !(hasRunCommand && transcriptAgeSec > maxRunCommandAgeSec)
+        && transcriptAgeSec <= maxRunningStatusAgeSec;
     const hasOpenBackgroundTask = activeOpenTasks.length > 0;
     const hasActiveTaskLog = activeTaskLogs.length > 0;
     const isAwaitingModelResponse = (
@@ -400,9 +634,14 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
         || last.type === 'USER_INPUT'
         || last.source === 'USER_EXPLICIT'
     )
-        && !(last.type === 'GENERIC' && isPassiveLastTimer)
+        && !(last.type === 'GENERIC' && (isPassiveLastTimer || isLastCanceledTask))
+        && !isLastForceStopSystemMsg
         && transcriptAgeSec <= maxThinkingAgeSec;
-    const isRecentTouch = transcriptAgeSec < recentTouchSec;
+    const isRecentTouch = transcriptAgeSec < recentTouchSec
+        && !isAskQuestion
+        && !isLastCanceledTask
+        && !isLastForceStopSystemMsg
+        && !(hasToolCalls && !isToolRunning);
 
     if (!isToolRunning && !isRunningStatus && !hasOpenBackgroundTask && !hasActiveTaskLog && !isAwaitingModelResponse && !isRecentTouch) {
         return null;
@@ -410,13 +649,21 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, options =
 
     const topic = extractSessionTopic(transcriptPath);
     let toolName = null;
-    if (isToolRunning && last.tool_calls[0] && last.tool_calls[0].name) {
-        toolName = last.tool_calls[0].name;
+    if (isToolRunning) {
+        if (approvalTool && approvalTool.name) {
+            toolName = approvalTool.name;
+        } else if (hasRunCommand) {
+            toolName = 'run_command';
+        } else if (toolCalls[0] && toolCalls[0].name) {
+            toolName = toolCalls[0].name;
+        }
     }
 
     let state = 'processing';
     if (isToolRunning) {
-        state = `running tool "${toolName}"`;
+        state = needsApproval
+            ? `awaiting approval for "${toolName}"`
+            : `running tool "${toolName}"`;
     } else if (hasOpenBackgroundTask) {
         const latestTask = activeOpenTasks[activeOpenTasks.length - 1];
         state = `running background task "${latestTask.shortId}"`;
@@ -512,12 +759,14 @@ function findActiveAntigravitySessions(options = {}) {
         if (!fs.existsSync(transcriptPath)) continue;
 
         const tasksDir = path.join(brainDir, convId, '.system_generated', 'tasks');
+        const messagesDir = path.join(brainDir, convId, '.system_generated', 'messages');
 
         try {
             const session = inspectAntigravitySession({
                 convId,
                 transcriptPath,
                 tasksDir,
+                messagesDir,
                 options
             });
             if (session) {
@@ -555,6 +804,7 @@ module.exports = {
     belongsToConversation,
     extractBackgroundTaskState,
     readTaskLogFiles,
+    readMessageNotices,
     inspectAntigravitySession,
     resolveExcludedSessionId,
     findActiveAntigravitySessions,

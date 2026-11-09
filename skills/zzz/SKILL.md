@@ -44,7 +44,7 @@ What this automatically handles:
 
 | Flag | Effect |
 | :--- | :--- |
-| `--check-only` / `-c` | Display active agent sessions and OS wake locks without sleeping |
+| `--check-only` / `--check` / `-c` | Display active agent sessions and OS wake locks without sleeping |
 | `--now` / `--skip-wait` | Bypass waiting for other active coding sessions |
 | `--delay <sec>` / `-d` | Override the 30-second grace countdown (e.g., `-d 5`) |
 | `--hibernate` | Hibernate (S4 Suspend-to-Disk) instead of Standby (S3/S0ix) |

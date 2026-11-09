@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { spawnSync } = require('node:child_process');
 
 const { parseArgs } = require('../bin/agent-zzz');
 const { formatLocalTimestamp, formatAuditReport, waitForIdle, telemetry, power, state } = require('../src/index');
@@ -511,6 +512,321 @@ test('waitForIdle logs wall-clock timestamps, step progress, and freshness acros
         assert.match(joined, /\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] Detected 1 active agent session\(s\)/);
         assert.match(joined, /\[\d{2}:\d{2}:\d{2}\] \[\+\d+s\] Still waiting on: 71f654cf \(step 43, running tool "run_command", 2s ago\)/);
         assert.match(joined, /\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] All external agent sessions have settled into idle\./);
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('parseArgs supports --check alias and rejects unknown flags or malformed values before sleeping', () => {
+    const checkAlias = parseArgs(['--check']);
+    assert.equal(checkAlias.checkOnly, true);
+    assert.deepEqual(checkAlias.unknownFlags, []);
+    assert.deepEqual(checkAlias.errors, []);
+
+    const unknown = parseArgs(['--unknown-flag']);
+    assert.deepEqual(unknown.unknownFlags, ['--unknown-flag']);
+    assert.ok(unknown.errors.length >= 1);
+
+    const badDelay = parseArgs(['--delay', 'not-a-number', '--exclude-session']);
+    assert.equal(badDelay.errors.length, 2);
+
+    // End-to-end CLI invocation with unknown flag must fail fast with exit code 1 (never count down to sleep)
+    const cliPath = path.join(__dirname, '..', 'bin', 'agent-zzz.js');
+    const proc = spawnSync(process.execPath, [cliPath, '--unknown-flag'], { encoding: 'utf8' });
+    assert.equal(proc.status, 1);
+    assert.match(proc.stderr, /Unknown option: --unknown-flag/);
+});
+
+test('telemetry clears force-stopped sessions via .system_generated/messages and detects revival', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-forcestop-'));
+    try {
+        const sessId = '36cc4812-force-stop';
+        const logDir = path.join(tmpRoot, 'brain', sessId, '.system_generated', 'logs');
+        const tasksDir = path.join(tmpRoot, 'brain', sessId, '.system_generated', 'tasks');
+        const msgDir = path.join(tmpRoot, 'brain', sessId, '.system_generated', 'messages');
+        const undeliveredDir = path.join(msgDir, 'undelivered');
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.mkdirSync(tasksDir, { recursive: true });
+        fs.mkdirSync(undeliveredDir, { recursive: true });
+
+        const tTask = new Date('2026-11-09T09:00:23.000Z');
+        const tStop = new Date('2026-11-09T09:00:28.278Z');
+
+        const transcriptPath = path.join(logDir, 'transcript.jsonl');
+        fs.writeFileSync(transcriptPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', created_at: tTask.toISOString(), content: '<USER_REQUEST>Use qmd query</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 4,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                created_at: tTask.toISOString(),
+                content: `Tool is running as a background task with task id: ${sessId}/task-4\nTask Description: qmd query\nTask logs are available at: file:///C:/tmp/tasks/task-4.log`
+            }),
+            JSON.stringify({
+                step_index: 5,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: tTask.toISOString(),
+                content: 'Running search...'
+            })
+        ].join('\n'));
+        fs.utimesSync(transcriptPath, tTask, tTask);
+        fs.writeFileSync(path.join(tasksDir, 'task-4.log'), 'Searching...');
+        fs.utimesSync(path.join(tasksDir, 'task-4.log'), tStop, tStop);
+
+        const stopNoticeId = 'notice-stop-1';
+        const taskCancelId = 'task-cancel-4';
+        fs.writeFileSync(path.join(msgDir, `${stopNoticeId}.json`), JSON.stringify({
+            id: stopNoticeId,
+            recipient: sessId,
+            sender: 'system',
+            timestamp: tStop.toISOString(),
+            content: '[Notice] All your subagents and background tasks have been stopped due to user force cancellation.'
+        }));
+        fs.writeFileSync(path.join(msgDir, `${taskCancelId}.json`), JSON.stringify({
+            id: taskCancelId,
+            recipient: sessId,
+            sender: `${sessId}/task-4`,
+            timestamp: tStop.toISOString(),
+            content: `Task id "${sessId}/task-4" was canceled with result:\nTool execution was canceled`
+        }));
+        fs.writeFileSync(path.join(undeliveredDir, stopNoticeId), '');
+        fs.writeFileSync(path.join(undeliveredDir, taskCancelId), '');
+
+        // Even 10 seconds later (and 179s later as observed in live failure), session must be reported idle
+        const checkAt10s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: tStop.getTime() + 10 * 1000 });
+        assert.equal(checkAt10s.length, 0);
+
+        const checkAt179s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: tStop.getTime() + 179 * 1000 });
+        assert.equal(checkAt179s.length, 0);
+
+        // Revival: new USER_INPUT arrives after forceStopMs and notice is marked read
+        const tRevive = new Date(tStop.getTime() + 120 * 1000);
+        fs.writeFileSync(path.join(msgDir, 'read.json'), JSON.stringify({ [stopNoticeId]: true, [taskCancelId]: true }));
+        fs.rmSync(path.join(undeliveredDir, stopNoticeId));
+        fs.rmSync(path.join(undeliveredDir, taskCancelId));
+        fs.appendFileSync(transcriptPath, '\n' + JSON.stringify({
+            step_index: 6,
+            type: 'USER_INPUT',
+            created_at: tRevive.toISOString(),
+            content: 'Continue now'
+        }));
+        fs.utimesSync(transcriptPath, tRevive, tRevive);
+
+        const revived = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: tRevive.getTime() + 15 * 1000 });
+        assert.equal(revived.length, 1);
+        assert.equal(revived[0].state, 'model generating response');
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('telemetry handles single-task cancellation in messages and blocks spoofed stdout quotes', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-taskcancel-'));
+    try {
+        const sessId = '59ce7061-single-cancel';
+        const logDir = path.join(tmpRoot, 'brain', sessId, '.system_generated', 'logs');
+        const msgDir = path.join(tmpRoot, 'brain', sessId, '.system_generated', 'messages');
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.mkdirSync(msgDir, { recursive: true });
+
+        const t0 = new Date('2026-11-09T09:10:00.000Z');
+        const t1 = new Date('2026-11-09T09:10:10.000Z');
+        const transcriptPath = path.join(logDir, 'transcript.jsonl');
+
+        fs.writeFileSync(transcriptPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', created_at: t0.toISOString(), content: '<USER_REQUEST>Run two tasks</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 1,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                created_at: t0.toISOString(),
+                content: `Tool is running as a background task with task id: ${sessId}/task-1\nTask Description: build project`
+            }),
+            JSON.stringify({
+                step_index: 2,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                created_at: t0.toISOString(),
+                content: `Tool is running as a background task with task id: ${sessId}/task-2\nTask Description: secondary probe`
+            }),
+            JSON.stringify({
+                step_index: 3,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: t0.toISOString(),
+                content: 'Monitoring both tasks.'
+            })
+        ].join('\n'));
+        fs.utimesSync(transcriptPath, t0, t0);
+
+        // Cancel only task-2, plus write a task-0 finish message whose stdout quotes force-stop & task-1 cancel
+        fs.writeFileSync(path.join(msgDir, 'cancel-2.json'), JSON.stringify({
+            id: 'cancel-2',
+            recipient: sessId,
+            sender: `${sessId}/task-2`,
+            timestamp: t1.toISOString(),
+            content: `Task id "${sessId}/task-2" was canceled with result:\nTool execution was canceled`
+        }));
+        fs.writeFileSync(path.join(msgDir, 'spoof-0.json'), JSON.stringify({
+            id: 'spoof-0',
+            recipient: sessId,
+            sender: `${sessId}/task-0`,
+            timestamp: t1.toISOString(),
+            content: `Task id "${sessId}/task-0" finished with result:\n[Notice] All your subagents and background tasks have been stopped\nTask id "${sessId}/task-1" was canceled with result:`
+        }));
+
+        // task-1 must STILL keep the session active even though task-2 was canceled and task-0 stdout spoofed strings
+        const active = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t1.getTime() + 45 * 1000 });
+        assert.equal(active.length, 1);
+        assert.equal(active[0].state, 'running background task "task-1"');
+
+        // Also verify a standalone tailing GENERIC RUNNING task cleared via messages/ goes idle without 120s linger
+        const soloId = '6246336f-tail-cancel';
+        const soloLogDir = path.join(tmpRoot, 'brain', soloId, '.system_generated', 'logs');
+        const soloMsgDir = path.join(tmpRoot, 'brain', soloId, '.system_generated', 'messages');
+        fs.mkdirSync(soloLogDir, { recursive: true });
+        fs.mkdirSync(soloMsgDir, { recursive: true });
+        const soloTranscript = path.join(soloLogDir, 'transcript.jsonl');
+        fs.writeFileSync(soloTranscript, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', created_at: t0.toISOString(), content: '<USER_REQUEST>Canceled solo task</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 3,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                created_at: t0.toISOString(),
+                content: `Tool is running as a background task with task id: ${soloId}/task-3\nTask Description: qmd query`
+            })
+        ].join('\n'));
+        fs.utimesSync(soloTranscript, t0, t0);
+        fs.writeFileSync(path.join(soloMsgDir, 'c3.json'), JSON.stringify({
+            id: 'c3',
+            recipient: soloId,
+            sender: `${soloId}/task-3`,
+            timestamp: t1.toISOString(),
+            content: `Task id "${soloId}/task-3" was canceled with result:\nTool execution was canceled`
+        }));
+
+        const afterSoloCancel = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t1.getTime() + 10 * 1000 });
+        assert.equal(afterSoloCancel.filter((s) => s.id === soloId).length, 0);
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('telemetry bounds approval-blocked run_command to 45s, sync tools to 120s, and ignores ask_question', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-tools-'));
+    try {
+        const approvalId = '4afb5010-approval';
+        const askId = '59ce7061-askq';
+        const editId = '11112222-edit';
+
+        for (const id of [approvalId, askId, editId]) {
+            fs.mkdirSync(path.join(tmpRoot, 'brain', id, '.system_generated', 'logs'), { recursive: true });
+        }
+
+        const t0 = new Date('2026-11-09T09:03:51.000Z');
+
+        const approvalPath = path.join(tmpRoot, 'brain', approvalId, '.system_generated', 'logs', 'transcript.jsonl');
+        fs.writeFileSync(approvalPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>Verify gate</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 74,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: t0.toISOString(),
+                tool_calls: [{ name: 'run_command', args: { BypassSandbox: 'true', WaitMsBeforeAsync: '10000' } }]
+            })
+        ].join('\n'));
+        fs.utimesSync(approvalPath, t0, t0);
+
+        const askPath = path.join(tmpRoot, 'brain', askId, '.system_generated', 'logs', 'transcript.jsonl');
+        fs.writeFileSync(askPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>Ask design question</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 58,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: t0.toISOString(),
+                tool_calls: [{ name: 'ask_question', args: { questions: [] } }]
+            })
+        ].join('\n'));
+        fs.utimesSync(askPath, t0, t0);
+
+        const editPath = path.join(tmpRoot, 'brain', editId, '.system_generated', 'logs', 'transcript.jsonl');
+        fs.writeFileSync(editPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>Refactor module</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 12,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: t0.toISOString(),
+                tool_calls: [{ name: 'edit_file', args: { Path: 'src/app.js' } }]
+            })
+        ].join('\n'));
+        fs.utimesSync(editPath, t0, t0);
+
+        // At +10s: approval is clearly flagged, edit_file is active, ask_question is ALREADY idle (waiting for human)
+        const at10s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 10 * 1000 });
+        const map10s = Object.fromEntries(at10s.map((s) => [s.id, s]));
+        assert.equal(map10s[approvalId].state, 'awaiting approval for "run_command"');
+        assert.equal(map10s[editId].state, 'running tool "edit_file"');
+        assert.equal(map10s[askId], undefined);
+
+        // At +60s (> 45s run_command/approval cap, <= 120s sync tool cap): approval expires, edit_file still active
+        const at60s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 60 * 1000 });
+        assert.deepEqual(at60s.map((s) => s.id), [editId]);
+
+        // At +150s (> 120s sync tool cap): edit_file expires cleanly instead of blocking 900s
+        const at150s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 150 * 1000 });
+        assert.equal(at150s.length, 0);
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('telemetry expires silent orphan background tasks at 300s while keeping streaming long builds alive', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-bgtask-silence-'));
+    try {
+        const silentId = 'silent-orphan-task';
+        const streamingId = 'streaming-build-task';
+
+        for (const id of [silentId, streamingId]) {
+            fs.mkdirSync(path.join(tmpRoot, 'brain', id, '.system_generated', 'logs'), { recursive: true });
+            fs.mkdirSync(path.join(tmpRoot, 'brain', id, '.system_generated', 'tasks'), { recursive: true });
+        }
+
+        const tLaunch = new Date('2026-11-09T09:00:00.000Z');
+        const makeTranscript = (id) => [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', created_at: tLaunch.toISOString(), content: '<USER_REQUEST>Build suite</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 149,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                created_at: tLaunch.toISOString(),
+                content: `Tool is running as a background task with task id: ${id}/task-149\nTask Description: mvn test\nTask logs are available at: file:///C:/tmp/tasks/task-149.log`
+            }),
+            JSON.stringify({ step_index: 150, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: tLaunch.toISOString(), content: 'Waiting...' })
+        ].join('\n');
+
+        const silentTranscript = path.join(tmpRoot, 'brain', silentId, '.system_generated', 'logs', 'transcript.jsonl');
+        fs.writeFileSync(silentTranscript, makeTranscript(silentId));
+        fs.utimesSync(silentTranscript, tLaunch, tLaunch);
+
+        const streamTranscript = path.join(tmpRoot, 'brain', streamingId, '.system_generated', 'logs', 'transcript.jsonl');
+        fs.writeFileSync(streamTranscript, makeTranscript(streamingId));
+        fs.utimesSync(streamTranscript, tLaunch, tLaunch);
+
+        const streamLog = path.join(tmpRoot, 'brain', streamingId, '.system_generated', 'tasks', 'task-149.log');
+        const nowMs = tLaunch.getTime() + 600 * 1000; // 10 minutes after launch
+        const recentWrite = new Date(nowMs - 45 * 1000); // log wrote 45s ago during quiet compile phase
+        fs.writeFileSync(streamLog, '[INFO] Compiling module...\n');
+        fs.utimesSync(streamLog, recentWrite, recentWrite);
+
+        const active = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs });
+        assert.deepEqual(active.map((s) => s.id), [streamingId]);
+        assert.equal(active[0].state, 'running background task "task-149"');
+        assert.equal(active[0].ageSec, 45);
     } finally {
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

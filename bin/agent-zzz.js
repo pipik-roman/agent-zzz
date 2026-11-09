@@ -23,7 +23,9 @@ function parseArgs(argv = []) {
         json: false,
         excludeSession: null,
         help: false,
-        version: false
+        version: false,
+        unknownFlags: [],
+        errors: []
     };
 
     for (let i = 0; i < argv.length; i++) {
@@ -36,7 +38,7 @@ function parseArgs(argv = []) {
             options.dryRun = true;
         } else if (arg === '--now' || arg === '--skip-wait') {
             options.waitIdle = false;
-        } else if (arg === '--check-only' || arg === '-c') {
+        } else if (arg === '--check-only' || arg === '--check' || arg === '-c') {
             options.checkOnly = true;
         } else if (arg === '--status') {
             options.status = true;
@@ -46,27 +48,47 @@ function parseArgs(argv = []) {
             options.hibernate = true;
         } else if (arg === '--no-force') {
             options.force = false;
-        } else if (arg === '--exclude-session' && argv[i + 1] && !argv[i + 1].startsWith('-')) {
-            options.excludeSession = argv[i + 1];
-            i++;
-        } else if ((arg === '--delay' || arg === '-d') && argv[i + 1] && !argv[i + 1].startsWith('-')) {
-            const parsed = parseInt(argv[i + 1], 10);
-            if (!isNaN(parsed) && parsed >= 0) {
+        } else if (arg === '--exclude-session') {
+            const next = argv[i + 1];
+            if (next && !next.startsWith('-')) {
+                options.excludeSession = next;
+                i++;
+            } else {
+                options.errors.push('Missing value for --exclude-session');
+            }
+        } else if (arg === '--delay' || arg === '-d') {
+            const next = argv[i + 1];
+            const parsed = next !== undefined ? parseInt(next, 10) : NaN;
+            if (next && !next.startsWith('-') && !isNaN(parsed) && parsed >= 0) {
                 options.delay = parsed;
                 i++;
+            } else {
+                options.errors.push(`Invalid value for ${arg}: expected non-negative integer seconds`);
+                if (next && !next.startsWith('-')) i++;
             }
-        } else if ((arg === '--timeout' || arg === '-t') && argv[i + 1] && !argv[i + 1].startsWith('-')) {
-            const parsed = parseInt(argv[i + 1], 10);
-            if (!isNaN(parsed) && parsed >= 0) {
+        } else if (arg === '--timeout' || arg === '-t') {
+            const next = argv[i + 1];
+            const parsed = next !== undefined ? parseInt(next, 10) : NaN;
+            if (next && !next.startsWith('-') && !isNaN(parsed) && parsed >= 0) {
                 options.timeoutMinutes = parsed;
                 i++;
+            } else {
+                options.errors.push(`Invalid value for ${arg}: expected non-negative integer minutes`);
+                if (next && !next.startsWith('-')) i++;
             }
-        } else if ((arg === '--poll' || arg === '-p') && argv[i + 1] && !argv[i + 1].startsWith('-')) {
-            const parsed = parseInt(argv[i + 1], 10);
-            if (!isNaN(parsed) && parsed > 0) {
+        } else if (arg === '--poll' || arg === '-p') {
+            const next = argv[i + 1];
+            const parsed = next !== undefined ? parseInt(next, 10) : NaN;
+            if (next && !next.startsWith('-') && !isNaN(parsed) && parsed > 0) {
                 options.pollIntervalSeconds = parsed;
                 i++;
+            } else {
+                options.errors.push(`Invalid value for ${arg}: expected positive integer seconds`);
+                if (next && !next.startsWith('-')) i++;
             }
+        } else {
+            options.unknownFlags.push(arg);
+            options.errors.push(`Unknown option: ${arg}`);
         }
     }
 
@@ -82,19 +104,19 @@ Usage:
   npx agent-zzz [options]
 
 Options:
-  --check-only, -c        Inspect active coding agent sessions & OS power locks without sleeping
-  --json                  Output audit telemetry as structured JSON
-  --now, --skip-wait      Sleep immediately without waiting for concurrent agent sessions
-  --delay, -d <seconds>   Abortable grace countdown before sleeping (default: 30)
-  --timeout, -t <minutes> Maximum minutes to wait for active agent sessions (default: 30)
-  --poll, -p <seconds>    Polling interval while waiting for idle state (default: 5)
-  --hibernate             Hibernate (S4) instead of Standby/Sleep (S3/S0ix)
-  --no-force              Allow OS applications/drivers to veto sleep via power locks
-  --exclude-session <id>  Explicitly exclude a conversation/session ID from concurrency audit
-  --status                Display the last pre-sleep state latch marker (power-pause.json)
-  --dry-run               Simulate audit and display the exact OS suspend command without sleeping
-  --version, -v           Show version number
-  --help, -h              Show this help message
+  --check-only, --check, -c Inspect active coding agent sessions & OS power locks without sleeping
+  --json                    Output audit telemetry as structured JSON
+  --now, --skip-wait        Sleep immediately without waiting for concurrent agent sessions
+  --delay, -d <seconds>     Abortable grace countdown before sleeping (default: 30)
+  --timeout, -t <minutes>   Maximum minutes to wait for active agent sessions (default: 30)
+  --poll, -p <seconds>      Polling interval while waiting for idle state (default: 5)
+  --hibernate               Hibernate (S4) instead of Standby/Sleep (S3/S0ix)
+  --no-force                Allow OS applications/drivers to veto sleep via power locks
+  --exclude-session <id>    Explicitly exclude a conversation/session ID from concurrency audit
+  --status                  Display the last pre-sleep state latch marker (power-pause.json)
+  --dry-run                 Simulate audit and display the exact OS suspend command without sleeping
+  --version, -v             Show version number
+  --help, -h                Show this help message
 
 Examples:
   agent-zzz               # Audit active agents, wait until idle, 30s countdown, then sleep
@@ -106,6 +128,14 @@ Examples:
 
 async function main() {
     const options = parseArgs(process.argv.slice(2));
+
+    if (options.errors.length > 0) {
+        for (const errMsg of options.errors) {
+            console.error(`Error: ${errMsg}`);
+        }
+        console.error('Run "agent-zzz --help" to see valid options.');
+        process.exit(1);
+    }
 
     if (options.help) {
         showHelp();

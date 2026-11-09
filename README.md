@@ -50,7 +50,7 @@ Usage:
   agent-zzz [options]
 
 Options:
-  --check-only, -c        Inspect active coding agent sessions & OS power locks without sleeping
+  --check-only, --check, -c Inspect active coding agent sessions & OS power locks without sleeping
   --json                  Output audit telemetry as structured JSON
   --now, --skip-wait      Sleep immediately without waiting for concurrent agent sessions
   --delay, -d <seconds>   Abortable grace countdown before sleeping (default: 30)

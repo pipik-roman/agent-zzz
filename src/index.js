@@ -139,32 +139,68 @@ async function waitForIdle(options = {}, logFn = console.log) {
 
 /**
  * Executes an abortable grace countdown before cutting OS power.
- * Prints clean newline intervals suitable for both interactive terminals and agent logs.
+ * When `options.monitorActivity` is true, continuously polls external agent telemetry
+ * during the countdown and interrupts early if an external session wakes up or resumes.
  * @param {number} delaySeconds
  * @param {string} mode
- * @param {Function} logFn
- * @returns {Promise<void>}
+ * @param {Function} [logFn]
+ * @param {Object} [options]
+ * @returns {Promise<{ completed: boolean, interrupted: boolean, activeSessions: Array<Object>, remainingSec?: number }>}
  */
-async function runGraceCountdown(delaySeconds, mode, logFn = console.log) {
-    if (delaySeconds <= 0) return;
+async function runGraceCountdown(delaySeconds, mode, logFn = console.log, options = {}) {
+    if (delaySeconds <= 0) {
+        return { completed: true, interrupted: false, activeSessions: [] };
+    }
 
     logFn(`\n[${formatLocalTimestamp(new Date(), true)}] System will enter ${mode} in ${delaySeconds} second(s). Press Ctrl+C to abort.`);
 
-    let remaining = delaySeconds;
-    while (remaining > 0) {
-        const step = remaining > 10 ? 10 : (remaining > 5 ? 5 : 1);
-        const waitSec = Math.min(step, remaining);
-        await sleepAsync(waitSec * 1000);
-        remaining -= waitSec;
+    const stepFor = (rem) => (rem > 10 ? 10 : (rem > 5 ? 5 : 1));
+    const monitorActivity = !!options.monitorActivity;
+    const pollSliceSec = monitorActivity
+        ? (typeof options.countdownPollSeconds === 'number' && options.countdownPollSeconds > 0
+            ? options.countdownPollSeconds
+            : (typeof options.pollIntervalSeconds === 'number' && options.pollIntervalSeconds > 0 && options.pollIntervalSeconds < 2
+                ? options.pollIntervalSeconds
+                : 2))
+        : delaySeconds;
 
-        if (remaining > 0) {
-            logFn(`  [${formatLocalTimestamp()}] ... ${remaining}s remaining before ${mode}`);
+    let remaining = delaySeconds;
+    let nextLogRemaining = Math.max(0, Number((delaySeconds - stepFor(delaySeconds)).toFixed(6)));
+
+    while (remaining > 0) {
+        const untilMilestone = Math.max(0, Number((remaining - nextLogRemaining).toFixed(6)));
+        const waitSec = monitorActivity
+            ? Math.min(pollSliceSec, untilMilestone > 0 ? untilMilestone : remaining, remaining)
+            : Math.min(stepFor(remaining), remaining);
+
+        await sleepAsync(waitSec * 1000);
+        remaining = Math.max(0, Number((remaining - waitSec).toFixed(6)));
+
+        if (monitorActivity) {
+            const active = telemetry.findActiveSessions(options);
+            if (active.length > 0) {
+                return {
+                    completed: false,
+                    interrupted: true,
+                    activeSessions: active,
+                    remainingSec: Math.ceil(remaining)
+                };
+            }
+        }
+
+        if (remaining > 0 && (!monitorActivity || remaining <= nextLogRemaining + 1e-6)) {
+            logFn(`  [${formatLocalTimestamp()}] ... ${Math.ceil(remaining)}s remaining before ${mode}`);
+            nextLogRemaining = Math.max(0, Number((remaining - stepFor(remaining)).toFixed(6)));
         }
     }
+
+    return { completed: true, interrupted: false, activeSessions: [] };
 }
 
 /**
- * Orchestrates the complete pre-flight audit, wait latch, countdown, and OS power transition.
+ * Orchestrates the complete pre-flight audit, wait latch, live-monitored countdown, and OS power transition.
+ * If an external agent wakes up or receives user confirmation during the grace countdown,
+ * the countdown pauses automatically and re-enters the idle-wait monitor.
  * @param {Object} options
  * @returns {Promise<{ success: boolean, message: string, audit?: Object }>}
  */
@@ -173,6 +209,8 @@ async function sleepSystem(options = {}) {
     const delay = typeof options.delay === 'number' ? options.delay : 30;
     const mode = options.hibernate ? 'hibernate' : 'sleep';
     const force = options.force !== false;
+    const suspendFn = options.executeSuspendFn || power.executeSuspend;
+    const platform = options.platform || process.platform;
 
     const initialAudit = checkStatus(options);
 
@@ -185,56 +223,96 @@ async function sleepSystem(options = {}) {
         };
     }
 
-    // Wait for concurrent sessions unless bypassed
-    if (options.waitIdle !== false) {
-        const waitRes = await waitForIdle(options, logFn);
-        if (!waitRes.ready) {
+    const startWaitMs = Date.now();
+    const baseTimeoutMin = typeof options.timeoutMinutes === 'number' ? options.timeoutMinutes : 30;
+    let finalAudit = initialAudit;
+    let warnedPowerLocks = false;
+
+    while (true) {
+        // Wait for concurrent sessions unless bypassed (--now)
+        if (options.waitIdle !== false) {
+            let waitOpts = options;
+            if (baseTimeoutMin > 0) {
+                const elapsedMin = (Date.now() - startWaitMs) / 60000;
+                const remainingMin = baseTimeoutMin - elapsedMin;
+                if (remainingMin <= 0) {
+                    return {
+                        success: false,
+                        audit: finalAudit,
+                        message: `[${formatLocalTimestamp(new Date(), true)}] Timed out after ${baseTimeoutMin}m waiting for active session(s) to finish.`
+                    };
+                }
+                waitOpts = { ...options, timeoutMinutes: remainingMin };
+            }
+
+            const waitRes = await waitForIdle(waitOpts, logFn);
+            if (!waitRes.ready) {
+                return {
+                    success: false,
+                    audit: finalAudit,
+                    message: waitRes.message
+                };
+            }
+        }
+
+        // Refresh OS power lock audit after sessions settle
+        finalAudit = checkStatus(options);
+        if (finalAudit.powerAudit && finalAudit.powerAudit.locks.length > 0) {
+            if (!warnedPowerLocks) {
+                logFn(`\n[${formatLocalTimestamp()}] Warning: ${finalAudit.powerAudit.message}`);
+                for (const lock of finalAudit.powerAudit.locks) {
+                    logFn(`  - [${lock.category}] ${lock.entry}`);
+                }
+                if (force) {
+                    logFn('Smart Force enabled: proceeding with requested sleep (pass --no-force to respect OS locks).');
+                }
+                warnedPowerLocks = true;
+            }
+            if (!force) {
+                return {
+                    success: false,
+                    audit: finalAudit,
+                    message: `[${formatLocalTimestamp(new Date(), true)}] Sleep aborted due to active OS wake locks (--no-force specified).`
+                };
+            }
+        }
+
+        // Dry-run mode
+        if (options.dryRun) {
+            const dryRes = suspendFn({ ...options, dryRun: true });
             return {
-                success: false,
-                audit: initialAudit,
-                message: waitRes.message
+                success: true,
+                audit: finalAudit,
+                message: `${formatAuditReport(finalAudit)}\n\n[Dry Run] Grace countdown would run for ${delay}s (force: ${force}).\n${dryRes.message}`
             };
         }
-    }
 
-    // Refresh OS power lock audit after sessions settle
-    const finalAudit = checkStatus(options);
-    if (finalAudit.powerAudit && finalAudit.powerAudit.locks.length > 0) {
-        logFn(`\n[${formatLocalTimestamp()}] Warning: ${finalAudit.powerAudit.message}`);
-        for (const lock of finalAudit.powerAudit.locks) {
-            logFn(`  - [${lock.category}] ${lock.entry}`);
-        }
-        if (force) {
-            logFn('Smart Force enabled: proceeding with requested sleep (pass --no-force to respect OS locks).');
-        } else {
+        if (platform !== 'win32') {
             return {
                 success: false,
                 audit: finalAudit,
-                message: `[${formatLocalTimestamp(new Date(), true)}] Sleep aborted due to active OS wake locks (--no-force specified).`
+                message: `Unsupported platform "${platform}". agent-zzz v0.1 currently supports Windows.`
             };
         }
-    }
 
-    // Dry-run mode
-    if (options.dryRun) {
-        const dryRes = power.executeSuspend({ ...options, dryRun: true });
-        return {
-            success: true,
-            audit: finalAudit,
-            message: `${formatAuditReport(finalAudit)}\n\n[Dry Run] Grace countdown would run for ${delay}s (force: ${force}).\n${dryRes.message}`
-        };
-    }
+        // Execute grace countdown while continuously re-checking external agent telemetry (unless --now)
+        const countdownRes = await runGraceCountdown(delay, mode, logFn, {
+            ...options,
+            monitorActivity: options.waitIdle !== false
+        });
 
-    if (process.platform !== 'win32') {
-        return {
-            success: false,
-            audit: finalAudit,
-            message: `Unsupported platform "${process.platform}". agent-zzz v0.1 currently supports Windows.`
-        };
-    }
+        if (countdownRes && countdownRes.interrupted) {
+            logFn(`\n[${formatLocalTimestamp(new Date(), true)}] Sleep countdown paused: external agent session resumed:`);
+            for (const s of countdownRes.activeSessions) {
+                const atTime = s.lastActivityAt ? ` @ ${formatLocalTimestamp(s.lastActivityAt)}` : '';
+                logFn(`  - [${s.harness}:${s.shortId}] "${s.topic}" (step ${s.step}, ${s.state}, active ${s.ageSec}s ago${atTime})`);
+            }
+            logFn('Returning to active-session monitor...\n');
+            continue;
+        }
 
-    // Execute grace countdown
-    await runGraceCountdown(delay, mode, logFn);
+        break;
+    }
 
     // Write durable pre-sleep state latch
     state.writeStateLatch({
@@ -245,7 +323,7 @@ async function sleepSystem(options = {}) {
     logFn(`[${formatLocalTimestamp(new Date(), true)}] Triggering OS ${mode} now...`);
 
     // Trigger OS sleep
-    const suspendRes = power.executeSuspend(options);
+    const suspendRes = suspendFn(options);
 
     // Upon system resume, update state latch
     if (suspendRes.success) {

@@ -467,7 +467,7 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, messagesD
         : (legacyTranscriptAge !== null ? Math.min(legacyTranscriptAge, 45) : 45);
     const maxApprovalAgeSec = typeof options.maxApprovalAgeSec === 'number'
         ? options.maxApprovalAgeSec
-        : (legacyTranscriptAge !== null ? Math.min(legacyTranscriptAge, 45) : 45);
+        : (legacyTranscriptAge !== null ? Math.min(legacyTranscriptAge, 60) : 60);
     const maxRunningStatusAgeSec = typeof options.maxRunningStatusAgeSec === 'number'
         ? options.maxRunningStatusAgeSec
         : (legacyTranscriptAge !== null ? legacyTranscriptAge : 120);
@@ -595,10 +595,8 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, messagesD
     const needsApproval = !!approvalTool;
 
     let effectiveToolMaxAgeSec = maxToolAgeSec;
-    if (needsApproval && hasRunCommand) {
-        effectiveToolMaxAgeSec = Math.min(maxRunCommandAgeSec, maxApprovalAgeSec);
-    } else if (needsApproval) {
-        effectiveToolMaxAgeSec = Math.min(maxToolAgeSec, maxApprovalAgeSec);
+    if (needsApproval) {
+        effectiveToolMaxAgeSec = maxApprovalAgeSec;
     } else if (hasRunCommand) {
         effectiveToolMaxAgeSec = maxRunCommandAgeSec;
     }
@@ -623,7 +621,7 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, messagesD
         && !isPassiveLastTimer
         && !isAskQuestion
         && !isLastCompletedTask
-        && !(hasRunCommand && transcriptAgeSec > maxRunCommandAgeSec)
+        && !(hasToolCalls && !isToolRunning)
         && transcriptAgeSec <= maxRunningStatusAgeSec;
     const hasOpenBackgroundTask = activeOpenTasks.length > 0;
     const hasActiveTaskLog = activeTaskLogs.length > 0;

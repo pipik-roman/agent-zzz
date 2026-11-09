@@ -6,7 +6,7 @@ const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 
 const { parseArgs } = require('../bin/agent-zzz');
-const { formatLocalTimestamp, formatAuditReport, waitForIdle, telemetry, power, state } = require('../src/index');
+const { formatLocalTimestamp, formatAuditReport, waitForIdle, runGraceCountdown, sleepSystem, telemetry, power, state } = require('../src/index');
 
 test('parseArgs parses defaults and custom flags cleanly', () => {
     const defaults = parseArgs([]);
@@ -714,14 +714,15 @@ test('telemetry handles single-task cancellation in messages and blocks spoofed 
     }
 });
 
-test('telemetry bounds approval-blocked run_command to 45s, sync tools to 120s, and ignores ask_question', () => {
+test('telemetry bounds non-bypass run_command to 45s, approval waits to 60s, sync tools to 120s, and ignores ask_question', () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-tools-'));
     try {
         const approvalId = '4afb5010-approval';
         const askId = '59ce7061-askq';
+        const runId = '22223333-run';
         const editId = '11112222-edit';
 
-        for (const id of [approvalId, askId, editId]) {
+        for (const id of [approvalId, askId, runId, editId]) {
             fs.mkdirSync(path.join(tmpRoot, 'brain', id, '.system_generated', 'logs'), { recursive: true });
         }
 
@@ -753,6 +754,19 @@ test('telemetry bounds approval-blocked run_command to 45s, sync tools to 120s, 
         ].join('\n'));
         fs.utimesSync(askPath, t0, t0);
 
+        const runPath = path.join(tmpRoot, 'brain', runId, '.system_generated', 'logs', 'transcript.jsonl');
+        fs.writeFileSync(runPath, [
+            JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>Quick shell command</USER_REQUEST>' }),
+            JSON.stringify({
+                step_index: 4,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: t0.toISOString(),
+                tool_calls: [{ name: 'run_command', args: { WaitMsBeforeAsync: '5000' } }]
+            })
+        ].join('\n'));
+        fs.utimesSync(runPath, t0, t0);
+
         const editPath = path.join(tmpRoot, 'brain', editId, '.system_generated', 'logs', 'transcript.jsonl');
         fs.writeFileSync(editPath, [
             JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>Refactor module</USER_REQUEST>' }),
@@ -766,16 +780,21 @@ test('telemetry bounds approval-blocked run_command to 45s, sync tools to 120s, 
         ].join('\n'));
         fs.utimesSync(editPath, t0, t0);
 
-        // At +10s: approval is clearly flagged, edit_file is active, ask_question is ALREADY idle (waiting for human)
+        // At +10s: approval, non-bypass run_command, and edit_file are active; ask_question is ALREADY idle
         const at10s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 10 * 1000 });
         const map10s = Object.fromEntries(at10s.map((s) => [s.id, s]));
         assert.equal(map10s[approvalId].state, 'awaiting approval for "run_command"');
+        assert.equal(map10s[runId].state, 'running tool "run_command"');
         assert.equal(map10s[editId].state, 'running tool "edit_file"');
         assert.equal(map10s[askId], undefined);
 
-        // At +60s (> 45s run_command/approval cap, <= 120s sync tool cap): approval expires, edit_file still active
-        const at60s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 60 * 1000 });
-        assert.deepEqual(at60s.map((s) => s.id), [editId]);
+        // At +55s (> 45s non-bypass run_command cap, <= 60s approval cap): approval & edit_file stay active, plain run_command expires
+        const at55s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 55 * 1000 });
+        assert.deepEqual(at55s.map((s) => s.id).sort(), [editId, approvalId].sort());
+
+        // At +70s (> 60s approval cap, <= 120s sync tool cap): approval expires, edit_file still active
+        const at70s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 70 * 1000 });
+        assert.deepEqual(at70s.map((s) => s.id), [editId]);
 
         // At +150s (> 120s sync tool cap): edit_file expires cleanly instead of blocking 900s
         const at150s = telemetry.findActiveAntigravitySessions({ appDataDir: tmpRoot, nowMs: t0.getTime() + 150 * 1000 });
@@ -828,6 +847,89 @@ test('telemetry expires silent orphan background tasks at 300s while keeping str
         assert.equal(active[0].state, 'running background task "task-149"');
         assert.equal(active[0].ageSec, 45);
     } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('sleepSystem pauses grace countdown and resumes waiting when an external agent wakes up mid-countdown', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-countdown-resume-'));
+    const latchFile = path.join(tmpRoot, 'power-pause.json');
+    const logs = [];
+    const origFind = telemetry.findActiveSessions;
+    const origAuditPower = power.auditPowerRequests;
+    const origSleepStates = power.getAvailableSleepStates;
+
+    let callNum = 0;
+    let suspendCalls = 0;
+
+    telemetry.findActiveSessions = () => {
+        callNum++;
+        // Call 1 (initialAudit), Call 2 (waitForIdle initial -> idle), Call 3 (finalAudit before 1st countdown),
+        // Call 4 (1st countdown tick -> idle), Call 5 (2nd countdown tick -> user approved step 76, 4afb5010 resumed!)
+        if (callNum === 5 || callNum === 6 || callNum === 7) {
+            return [{
+                harness: 'antigravity',
+                id: '4afb5010-resumed',
+                shortId: '4afb5010',
+                step: 78,
+                ageSec: 1,
+                lastActivityAt: new Date().toISOString(),
+                state: 'running tool "read_file"',
+                topic: 'VerificationAgent review'
+            }];
+        }
+        return [];
+    };
+    power.auditPowerRequests = () => ({ locks: [], message: 'No active OS locks.' });
+    power.getAvailableSleepStates = () => ({ available: true, states: ['Standby (S3)'] });
+
+    try {
+        const res = await sleepSystem({
+            appDataDir: tmpRoot,
+            stateFile: latchFile,
+            platform: 'win32',
+            delay: 0.08,
+            countdownPollSeconds: 0.02,
+            pollIntervalSeconds: 0.02,
+            timeoutMinutes: 1,
+            logFn: (line) => logs.push(line),
+            executeSuspendFn: () => {
+                suspendCalls++;
+                return { success: true, message: 'Mock suspend triggered.' };
+            }
+        });
+
+        assert.equal(res.success, true);
+        assert.equal(suspendCalls, 1);
+
+        const joined = logs.join('\n');
+        assert.match(joined, /Sleep countdown paused: external agent session resumed:/);
+        assert.match(joined, /4afb5010.*step 78, running tool "read_file"/);
+        assert.match(joined, /Returning to active-session monitor/);
+        // Must only trigger suspend after the second countdown finishes completely
+        assert.ok(joined.indexOf('Returning to active-session monitor') < joined.indexOf('Triggering OS sleep now'));
+
+        // Passing --now (waitIdle: false) must NOT monitor external activity during countdown
+        callNum = 0;
+        suspendCalls = 0;
+        const nowRes = await sleepSystem({
+            appDataDir: tmpRoot,
+            stateFile: latchFile,
+            platform: 'win32',
+            waitIdle: false,
+            delay: 0.05,
+            logFn: () => {},
+            executeSuspendFn: () => {
+                suspendCalls++;
+                return { success: true, message: 'Immediate suspend.' };
+            }
+        });
+        assert.equal(nowRes.success, true);
+        assert.equal(suspendCalls, 1);
+    } finally {
+        telemetry.findActiveSessions = origFind;
+        power.auditPowerRequests = origAuditPower;
+        power.getAvailableSleepStates = origSleepStates;
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 });

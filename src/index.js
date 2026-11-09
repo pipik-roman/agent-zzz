@@ -34,14 +34,19 @@ function sleepAsync(ms) {
  */
 function checkStatus(options = {}) {
     const excludedSessionId = telemetry.resolveExcludedSessionId(options);
-    const activeSessions = telemetry.findActiveSessions(options);
+    const diagnostics = { permissionDeniedCount: 0, unreadableCount: 0 };
+    const activeSessions = telemetry.findActiveSessions({ ...options, _diagnostics: diagnostics });
+    const permissionDeniedCount = diagnostics.permissionDeniedCount || 0;
+    const telemetryBlocked = permissionDeniedCount > 0;
     const sleepStates = power.getAvailableSleepStates();
     const powerAudit = power.auditPowerRequests();
     const lastLatch = state.readStateLatch(options);
 
     return {
         checkedAt: new Date().toISOString(),
-        readyToSleep: activeSessions.length === 0,
+        readyToSleep: activeSessions.length === 0 && !telemetryBlocked,
+        telemetryBlocked,
+        unreadableSessions: permissionDeniedCount,
         excludedSessionId: excludedSessionId || null,
         activeSessions,
         sleepStates,
@@ -64,7 +69,17 @@ function formatAuditReport(audit) {
         lines.push(`Self-exclusion active: ignoring session [${audit.excludedSessionId.slice(0, 8)}]`);
     }
 
-    if (audit.activeSessions.length === 0) {
+    if (audit.telemetryBlocked) {
+        lines.push(`Agent sessions: TELEMETRY BLOCKED — ${audit.unreadableSessions} external session(s) could not be read (EPERM/EACCES, likely sandbox isolation).`);
+        lines.push('  Run outside the sandbox (BypassSandbox: true) to audit sibling sessions, or pass --now to bypass telemetry.');
+        if (audit.activeSessions.length > 0) {
+            lines.push(`  Readable active session(s) detected: ${audit.activeSessions.length}`);
+            for (const s of audit.activeSessions) {
+                const atTime = s.lastActivityAt ? ` @ ${formatLocalTimestamp(s.lastActivityAt)}` : '';
+                lines.push(`  - [${s.harness}:${s.shortId}] "${s.topic}" (step ${s.step}, ${s.state}, ${s.ageSec}s ago${atTime})`);
+            }
+        }
+    } else if (audit.activeSessions.length === 0) {
         lines.push('Agent sessions: All external coding agent sessions are idle.');
     } else {
         lines.push(`Agent sessions: ${audit.activeSessions.length} active session(s) detected:`);
@@ -214,12 +229,21 @@ async function sleepSystem(options = {}) {
 
     const initialAudit = checkStatus(options);
 
-    // Check-only mode
+    // Check-only mode (fails closed if sandbox/permissions blocked external session telemetry)
     if (options.checkOnly) {
         return {
-            success: true,
+            success: !initialAudit.telemetryBlocked,
             audit: initialAudit,
             message: formatAuditReport(initialAudit)
+        };
+    }
+
+    // Refuse to sleep blindly when external telemetry cannot be read unless --now is explicitly requested
+    if (initialAudit.telemetryBlocked && options.waitIdle !== false) {
+        return {
+            success: false,
+            audit: initialAudit,
+            message: `[${formatLocalTimestamp(new Date(), true)}] Aborted: cannot verify external agent sessions (${initialAudit.unreadableSessions} session(s) returned EPERM/EACCES, likely sandbox isolation). Re-run outside the sandbox (BypassSandbox: true) or pass --now to sleep without telemetry.`
         };
     }
 
@@ -255,8 +279,15 @@ async function sleepSystem(options = {}) {
             }
         }
 
-        // Refresh OS power lock audit after sessions settle
+        // Refresh OS power lock audit and telemetry readability after sessions settle
         finalAudit = checkStatus(options);
+        if (finalAudit.telemetryBlocked && options.waitIdle !== false) {
+            return {
+                success: false,
+                audit: finalAudit,
+                message: `[${formatLocalTimestamp(new Date(), true)}] Aborted: telemetry lost access to ${finalAudit.unreadableSessions} external session(s) (EPERM/EACCES). Re-run outside the sandbox (BypassSandbox: true) or pass --now to force sleep.`
+            };
+        }
         if (finalAudit.powerAudit && finalAudit.powerAudit.locks.length > 0) {
             if (!warnedPowerLocks) {
                 logFn(`\n[${formatLocalTimestamp()}] Warning: ${finalAudit.powerAudit.message}`);

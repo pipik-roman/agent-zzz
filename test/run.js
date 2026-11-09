@@ -933,3 +933,80 @@ test('sleepSystem pauses grace countdown and resumes waiting when an external ag
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 });
+
+test('telemetry fails closed on EPERM/EACCES sandbox isolation instead of reporting false idle', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-eperm-'));
+    const blockedId = 'blocked-sibling-session';
+    const selfId = 'self-calling-session';
+    const origStatSync = fs.statSync;
+    const origAuditPower = power.auditPowerRequests;
+    const origSleepStates = power.getAvailableSleepStates;
+
+    try {
+        fs.mkdirSync(path.join(tmpRoot, 'brain', blockedId, '.system_generated', 'logs'), { recursive: true });
+        fs.mkdirSync(path.join(tmpRoot, 'brain', selfId, '.system_generated', 'logs'), { recursive: true });
+        fs.writeFileSync(path.join(tmpRoot, 'brain', selfId, '.system_generated', 'logs', 'transcript.jsonl'), '{}\n');
+
+        fs.statSync = (targetPath, ...rest) => {
+            if (typeof targetPath === 'string' && targetPath.includes(blockedId) && targetPath.endsWith('transcript.jsonl')) {
+                const err = new Error('EPERM: operation not permitted');
+                err.code = 'EPERM';
+                throw err;
+            }
+            return origStatSync.call(fs, targetPath, ...rest);
+        };
+        power.auditPowerRequests = () => ({ locks: [], message: 'No active OS locks.' });
+        power.getAvailableSleepStates = () => ({ available: true, states: ['Standby (S3)'] });
+
+        // Check-only must report blocked status and fail closed (success: false, readyToSleep: false)
+        const checkRes = await sleepSystem({
+            appDataDir: tmpRoot,
+            excludeSession: selfId,
+            checkOnly: true,
+            platform: 'win32'
+        });
+        assert.equal(checkRes.success, false);
+        assert.equal(checkRes.audit.readyToSleep, false);
+        assert.equal(checkRes.audit.telemetryBlocked, true);
+        assert.equal(checkRes.audit.unreadableSessions, 1);
+        assert.match(checkRes.message, /TELEMETRY BLOCKED.*EPERM\/EACCES/i);
+
+        // Normal sleep without --now must refuse to suspend blindly
+        let suspendCalls = 0;
+        const blockedRes = await sleepSystem({
+            appDataDir: tmpRoot,
+            excludeSession: selfId,
+            platform: 'win32',
+            delay: 0.02,
+            executeSuspendFn: () => {
+                suspendCalls++;
+                return { success: true, message: 'Suspended.' };
+            }
+        });
+        assert.equal(blockedRes.success, false);
+        assert.equal(suspendCalls, 0);
+        assert.match(blockedRes.message, /BypassSandbox: true/);
+
+        // Explicit --now bypasses telemetry blocking intentionally
+        const nowRes = await sleepSystem({
+            appDataDir: tmpRoot,
+            excludeSession: selfId,
+            stateFile: path.join(tmpRoot, 'power-pause.json'),
+            platform: 'win32',
+            waitIdle: false,
+            delay: 0.02,
+            logFn: () => {},
+            executeSuspendFn: () => {
+                suspendCalls++;
+                return { success: true, message: 'Suspended.' };
+            }
+        });
+        assert.equal(nowRes.success, true);
+        assert.equal(suspendCalls, 1);
+    } finally {
+        fs.statSync = origStatSync;
+        power.auditPowerRequests = origAuditPower;
+        power.getAvailableSleepStates = origSleepStates;
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});

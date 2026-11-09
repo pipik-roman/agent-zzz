@@ -14,12 +14,17 @@ Use this skill whenever the user asks to **put the PC to sleep**, **suspend the 
 
 ## Operational Workflow
 
+> [!CAUTION]
+> **Sandbox Requirement (Antigravity & Sandboxed Harnesses)**:
+> Concurrency telemetry reads sibling conversation transcripts outside the workspace (`~/.gemini/antigravity/brain/`) and triggers native OS suspend. Run commands **outside the sandbox (`BypassSandbox: true`)** — inside an isolated sandbox, sibling transcripts return `EPERM` and `agent-zzz` fails closed instead of suspending blindly.
+
 ### 1. Pre-Flight Diagnostic Check (Non-Mutating)
 Before suspending, inspect concurrent sessions and system power locks:
 
 ```bash
-npx agent-zzz --check-only
+agent-zzz --check-only
 ```
+*(Fallback if not installed globally: `npx --yes agent-zzz --check-only`)*
 
 - If active external agent sessions are detected, inform the user which sessions are currently running.
 - If the user asked to sleep *immediately*, use `--now`.
@@ -28,14 +33,15 @@ npx agent-zzz --check-only
 ### 2. Trigger Safe Coordinated Sleep
 
 ```bash
-npx agent-zzz
+agent-zzz
 ```
+*(Fallback: `npx --yes agent-zzz`; pass `WaitMsBeforeAsync: 10000` so waiting and countdown stream cleanly in the background.)*
 
 What this automatically handles:
 1. **Self-Exclusion**: Automatically excludes your current conversation ID (`ANTIGRAVITY_CONVERSATION_ID`) so the agent never deadlocks waiting for itself.
-2. **Concurrency Polling**: Waits (up to 30m by default) until all other active agent sessions settle into idle.
+2. **Concurrency Polling**: Waits (up to 30m by default) until all other active agent sessions settle into idle, ignoring canceled/force-stopped sessions and passive `Timer:`/`Cron:` schedules.
 3. **Hardened OS Suspend**: Uses WinForms CLR `SetSuspendState` on Windows, avoiding the `rundll32.exe powrprof.dll` Win32 ABI pointer trap that triggers unintended hibernation or silent drops.
-4. **30s Grace Countdown**: Streams an abortable 30-second countdown so a human at the keyboard can cancel (`Ctrl+C`), while allowing unattended tasks to finish cleanly.
+4. **Live-Monitored 30s Grace Countdown**: Streams an abortable 30-second countdown while polling external sessions every 2s — if an external agent resumes or a user approves a prompt mid-countdown, sleep pauses automatically and returns to waiting.
 5. **Durable State Latch**: Writes `~/.gemini/power-pause.json` prior to suspending so harnesses know upon wake-up that the pause was intentional.
 
 ---

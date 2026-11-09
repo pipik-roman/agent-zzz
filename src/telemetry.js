@@ -499,6 +499,9 @@ function inspectAntigravitySession({ convId, transcriptPath, tasksDir, messagesD
         return null;
     }
 
+    // Surface read permission failures (e.g. sandbox EPERM) to caller instead of returning empty tail
+    fs.accessSync(transcriptPath, fs.constants.R_OK);
+
     const { entries } = getTailEntries(transcriptPath, maxTailBytes);
     if (entries.length === 0) return null;
 
@@ -726,25 +729,42 @@ function resolveExcludedSessionId(options = {}) {
 }
 
 /**
- * Scans Google Antigravity brain transcripts for actively executing sessions.
- * @param {Object} options
- * @returns {Array<Object>}
+ * Scans Google Antigravity brain transcripts for actively executing sessions and records
+ * any permission/access errors (`EPERM` / `EACCES`, e.g. when running inside an isolated sandbox).
+ * @param {Object} [options]
+ * @returns {{ sessions: Array<Object>, permissionDeniedCount: number, unreadableCount: number }}
  */
-function findActiveAntigravitySessions(options = {}) {
+function auditAntigravitySessions(options = {}) {
     const appDataDir = options.appDataDir || process.env.ANTIGRAVITY_APP_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity');
     const brainDir = path.join(appDataDir, 'brain');
     const excludedId = resolveExcludedSessionId(options);
 
-    if (!fs.existsSync(brainDir)) return [];
+    const report = {
+        sessions: [],
+        permissionDeniedCount: 0,
+        unreadableCount: 0
+    };
+
+    try {
+        fs.statSync(brainDir);
+    } catch (e) {
+        if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+            report.permissionDeniedCount++;
+            report.unreadableCount++;
+        }
+        return report;
+    }
 
     let entries = [];
     try {
         entries = fs.readdirSync(brainDir, { withFileTypes: true });
     } catch (e) {
-        return [];
+        if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+            report.permissionDeniedCount++;
+            report.unreadableCount++;
+        }
+        return report;
     }
-
-    const activeSessions = [];
 
     for (const entry of entries) {
         if (!entry.isDirectory()) continue;
@@ -754,7 +774,15 @@ function findActiveAntigravitySessions(options = {}) {
         if (excludedId && convId === excludedId) continue;
 
         const transcriptPath = path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl');
-        if (!fs.existsSync(transcriptPath)) continue;
+        try {
+            fs.statSync(transcriptPath);
+        } catch (e) {
+            if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+                report.permissionDeniedCount++;
+                report.unreadableCount++;
+            }
+            continue;
+        }
 
         const tasksDir = path.join(brainDir, convId, '.system_generated', 'tasks');
         const messagesDir = path.join(brainDir, convId, '.system_generated', 'messages');
@@ -768,29 +796,61 @@ function findActiveAntigravitySessions(options = {}) {
                 options
             });
             if (session) {
-                activeSessions.push(session);
+                report.sessions.push(session);
             }
         } catch (e) {
-            // Skip unreadable transcript
+            report.unreadableCount++;
+            if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+                report.permissionDeniedCount++;
+            }
         }
     }
 
-    return activeSessions;
+    return report;
+}
+
+/**
+ * Scans Google Antigravity brain transcripts for actively executing sessions.
+ * @param {Object} options
+ * @returns {Array<Object>}
+ */
+function findActiveAntigravitySessions(options = {}) {
+    return auditAntigravitySessions(options).sessions;
+}
+
+/**
+ * Aggregates active agent sessions and telemetry permission diagnostics across adapters.
+ * v0.1 focuses on Antigravity; modularized for Claude Code / Cursor / Crush in v0.2+.
+ * @param {Object} [options]
+ * @returns {{ sessions: Array<Object>, permissionDeniedCount: number, unreadableCount: number }}
+ */
+function auditSessions(options = {}) {
+    const adapters = [auditAntigravitySessions];
+    const aggregate = {
+        sessions: [],
+        permissionDeniedCount: 0,
+        unreadableCount: 0
+    };
+    for (const adapter of adapters) {
+        const res = adapter(options);
+        aggregate.sessions = aggregate.sessions.concat(res.sessions);
+        aggregate.permissionDeniedCount += res.permissionDeniedCount;
+        aggregate.unreadableCount += res.unreadableCount;
+    }
+    if (options && typeof options._diagnostics === 'object' && options._diagnostics !== null) {
+        options._diagnostics.permissionDeniedCount = aggregate.permissionDeniedCount;
+        options._diagnostics.unreadableCount = aggregate.unreadableCount;
+    }
+    return aggregate;
 }
 
 /**
  * Aggregates active agent sessions across supported telemetry adapters.
- * v0.1 focuses on Antigravity; modularized for Claude Code / Cursor / Crush in v0.2+.
  * @param {Object} options
  * @returns {Array<Object>}
  */
 function findActiveSessions(options = {}) {
-    const adapters = [findActiveAntigravitySessions];
-    let results = [];
-    for (const adapter of adapters) {
-        results = results.concat(adapter(options));
-    }
-    return results;
+    return auditSessions(options).sessions;
 }
 
 module.exports = {
@@ -805,6 +865,8 @@ module.exports = {
     readMessageNotices,
     inspectAntigravitySession,
     resolveExcludedSessionId,
+    auditAntigravitySessions,
     findActiveAntigravitySessions,
+    auditSessions,
     findActiveSessions
 };

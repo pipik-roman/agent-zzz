@@ -1,4 +1,20 @@
+const fs = require('fs');
+const path = require('path');
 const { spawnSync } = require('child_process');
+
+/**
+ * Resolves a Windows System32 executable path explicitly so current-working-directory
+ * binary planting cannot shadow trusted system tools (`powercfg.exe`, `powershell.exe`).
+ * @param {string[]} subPathSegments
+ * @param {string} fallbackExe
+ * @returns {string}
+ */
+function resolveWindowsSystemExe(subPathSegments, fallbackExe) {
+    if (process.platform !== 'win32') return fallbackExe;
+    const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+    const candidate = path.join(systemRoot, 'System32', ...subPathSegments);
+    return fs.existsSync(candidate) ? candidate : fallbackExe;
+}
 
 /**
  * Builds the hardened PowerShell CLR command to trigger Windows Standby or Hibernate.
@@ -26,7 +42,8 @@ function getAvailableSleepStates() {
         return { available: false, states: [], error: `Unsupported platform: ${process.platform}` };
     }
 
-    const res = spawnSync('powercfg', ['/availablesleepstates'], {
+    const powercfgExe = resolveWindowsSystemExe(['powercfg.exe'], 'powercfg');
+    const res = spawnSync(powercfgExe, ['/availablesleepstates'], {
         encoding: 'utf8',
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe']
@@ -78,7 +95,8 @@ function auditPowerRequests() {
         };
     }
 
-    const res = spawnSync('powercfg', ['/requests'], {
+    const powercfgExe = resolveWindowsSystemExe(['powercfg.exe'], 'powercfg');
+    const res = spawnSync(powercfgExe, ['/requests'], {
         encoding: 'utf8',
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe']
@@ -156,16 +174,17 @@ function executeSuspend(options = {}) {
     }
 
     const psCommand = buildWindowsSuspendCommand(options);
+    const psExe = resolveWindowsSystemExe(['WindowsPowerShell', 'v1.0', 'powershell.exe'], 'powershell.exe');
 
     if (options.dryRun) {
         return {
             success: true,
             command: psCommand,
-            message: `[Dry Run] Would execute ${mode} via PowerShell CLR:\n  powershell.exe -NoProfile -NonInteractive -Command "${psCommand}"`
+            message: `[Dry Run] Would execute ${mode} via PowerShell CLR:\n  "${psExe}" -NoProfile -NonInteractive -Command "${psCommand}"`
         };
     }
 
-    const result = spawnSync('powershell.exe', [
+    const result = spawnSync(psExe, [
         '-NoProfile',
         '-NonInteractive',
         '-Command',
@@ -201,6 +220,7 @@ function executeSuspend(options = {}) {
 }
 
 module.exports = {
+    resolveWindowsSystemExe,
     buildWindowsSuspendCommand,
     getAvailableSleepStates,
     auditPowerRequests,

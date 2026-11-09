@@ -12,6 +12,13 @@
     "check": "node bin/agent-zzz.js --check-only",
     "dry-run": "node bin/agent-zzz.js --dry-run"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "skills/",
+    "README.md",
+    "LICENSE"
+  ],
   "keywords": [
     "agent",
     "ai",
@@ -26,7 +33,7 @@
     "pc-sleep",
     "powercfg"
   ],
-  "author": "Roman Pipík <roman.pipik@dominanz.sk>",
+  "author": "Roman Pipík <pipik.roman@gmail.com>",
   "license": "MIT",
   "repository": {
     "type": "git",

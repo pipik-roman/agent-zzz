@@ -6,13 +6,17 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
-        node-version: [18.x, 20.x, 22.x]
+        node-version: [18.x, 20.x, 22.x, 24.x]
 
     steps:
       - uses: actions/checkout@v4
@@ -22,5 +26,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - name: Run unit tests
         run: npm test
-      - name: Run CLI help check
-        run: node bin/agent-zzz.js --help
+      - name: Verify CLI entrypoint and LF shebang
+        run: |
+          node bin/agent-zzz.js --version
+          node bin/agent-zzz.js --help
+          node -e "if (require('fs').readFileSync('bin/agent-zzz.js').includes('\r\n')) { console.error('CRLF detected in bin/agent-zzz.js'); process.exit(1); }"
+      - name: Verify npm package tarball
+        run: npm pack --dry-run

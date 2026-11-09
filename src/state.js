@@ -4,14 +4,15 @@ const os = require('os');
 
 /**
  * Resolves the path to the durable state latch file.
+ * Keeps user terminals and sandboxed agent shells aligned on the same default latch path.
  * @param {Object} options
  * @returns {string}
  */
 function getStateLatchPath(options = {}) {
     if (options.stateFile) return path.resolve(options.stateFile);
     if (process.env.AGENT_ZZZ_STATE_FILE) return path.resolve(process.env.AGENT_ZZZ_STATE_FILE);
-    const appDataDir = options.appDataDir || process.env.ANTIGRAVITY_APP_DATA_DIR || path.join(os.homedir(), '.gemini');
-    return path.join(appDataDir, 'power-pause.json');
+    if (options.appDataDir) return path.join(options.appDataDir, 'power-pause.json');
+    return path.join(os.homedir(), '.gemini', 'agent-zzz', 'power-pause.json');
 }
 
 /**

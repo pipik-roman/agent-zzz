@@ -8,6 +8,8 @@
 
 ## ⚡ Quick Start
 
+> **Current POC Scope (v0.1)**: Supports **Windows 10/11** and **Google Antigravity** telemetry. Cross-platform support (macOS, Linux) and Claude Code / Cursor adapters arrive in v0.2.
+
 Run a non-mutating check of active agent sessions and OS sleep states:
 ```bash
 npx agent-zzz --check-only
@@ -39,7 +41,17 @@ Most developer tools with "sleep" in their name are either **memory consolidatio
 ### Three Problems Solved Out of the Box
 1. **The Self-Deadlock Hazard**: When an agent asks "are any agents running?", naive scripts scan disk transcripts, discover the invoking conversation itself is active, and wait forever for themselves to finish. `agent-zzz` inspects runtime IDs (`ANTIGRAVITY_CONVERSATION_ID`, `--exclude-session`) for deterministic self-exclusion.
 2. **The Windows `rundll32` ABI Trap**: Calling `rundll32.exe powrprof.dll,SetSuspendState 0,1,0` passes an `HWND` pointer instead of a boolean to `SetSuspendState`, forcing unwanted Hibernation or failing silently when hibernation is disabled. `agent-zzz` uses hardened WinForms CLR calls (`[System.Windows.Forms.Application]::SetSuspendState`).
-3. **Aborted Streams & Corrupted Worktrees**: Instead of instantly severing TCP sockets when an agent wraps up, `agent-zzz` observes a 30-second abortable grace countdown and writes a durable state latch (`~/.gemini/power-pause.json`) so agents recognize an intentional sleep upon wake-up.
+3. **Aborted Streams & Corrupted Worktrees**: Instead of instantly severing TCP sockets when an agent wraps up, `agent-zzz` observes a 30-second live-monitored countdown and writes a durable state latch (`~/.gemini/agent-zzz/power-pause.json`) so agents recognize an intentional sleep upon wake-up.
+
+---
+
+## 🔒 Security & Safety
+
+- **Zero Runtime Dependencies & Zero Install Scripts**: Ships pure Node.js standard library modules only, reducing supply-chain risk when run via `npx agent-zzz`.
+- **Fail-Closed Sandbox Protection**: If filesystem sandboxing returns `EPERM`/`EACCES` on sibling agent transcripts, `--check` and default sleep abort cleanly rather than suspending blindly.
+- **Hardened Windows Binary Resolution**: Resolves `powercfg.exe` and `powershell.exe` explicitly from `%SystemRoot%\System32` (`shell: false`) to prevent current-directory binary planting in untrusted repositories.
+- **Prompt-Injection Defense**: Keep human approval enabled when an agent requests `--now` or `--delay 0`; avoid globally auto-approving `--now` shortcuts across untrusted workspaces.
+- See [SECURITY.md](SECURITY.md) for vulnerability reporting and full threat-model details.
 
 ---
 

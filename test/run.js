@@ -1010,3 +1010,42 @@ test('telemetry fails closed on EPERM/EACCES sandbox isolation instead of report
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 });
+
+test('power resolves System32 executables explicitly and state latch ignores ANTIGRAVITY_APP_DATA_DIR drift', () => {
+    const origAppData = process.env.ANTIGRAVITY_APP_DATA_DIR;
+    const origStateFile = process.env.AGENT_ZZZ_STATE_FILE;
+
+    try {
+        delete process.env.AGENT_ZZZ_STATE_FILE;
+        process.env.ANTIGRAVITY_APP_DATA_DIR = path.join(os.tmpdir(), 'antigravity-sandbox-dir');
+        const insideAgentPath = state.getStateLatchPath({});
+
+        delete process.env.ANTIGRAVITY_APP_DATA_DIR;
+        const outsideAgentPath = state.getStateLatchPath({});
+
+        assert.equal(insideAgentPath, outsideAgentPath);
+        assert.equal(
+            outsideAgentPath,
+            path.join(os.homedir(), '.gemini', 'agent-zzz', 'power-pause.json')
+        );
+
+        const overridePath = state.getStateLatchPath({ appDataDir: path.join(os.tmpdir(), 'custom-test-dir') });
+        assert.equal(overridePath, path.join(os.tmpdir(), 'custom-test-dir', 'power-pause.json'));
+
+        if (process.platform === 'win32') {
+            const psExe = power.resolveWindowsSystemExe(['WindowsPowerShell', 'v1.0', 'powershell.exe'], 'powershell.exe');
+            const pcfgExe = power.resolveWindowsSystemExe(['powercfg.exe'], 'powercfg');
+            assert.match(psExe, /\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/i);
+            assert.match(pcfgExe, /\\System32\\powercfg\.exe$/i);
+
+            const dryRun = power.executeSuspend({ dryRun: true });
+            assert.equal(dryRun.success, true);
+            assert.match(dryRun.message, /\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe/i);
+        }
+    } finally {
+        if (origAppData === undefined) delete process.env.ANTIGRAVITY_APP_DATA_DIR;
+        else process.env.ANTIGRAVITY_APP_DATA_DIR = origAppData;
+        if (origStateFile === undefined) delete process.env.AGENT_ZZZ_STATE_FILE;
+        else process.env.AGENT_ZZZ_STATE_FILE = origStateFile;
+    }
+});

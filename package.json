@@ -1,6 +1,6 @@
 {
   "name": "agent-zzz",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Safe, agent-aware computer sleep and hardware power management for autonomous coding agents.",
   "main": "src/index.js",
   "bin": {

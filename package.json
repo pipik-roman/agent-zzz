@@ -1,7 +1,7 @@
 {
   "name": "agent-zzz",
   "version": "0.1.0",
-  "description": "Safe, agent-aware PC sleep and hardware power management for autonomous coding agents.",
+  "description": "Safe, agent-aware computer sleep and hardware power management for autonomous coding agents.",
   "main": "src/index.js",
   "bin": {
     "agent-zzz": "bin/agent-zzz.js",
@@ -26,6 +26,8 @@
     "power",
     "antigravity",
     "claude-code",
+    "github-copilot",
+    "copilot",
     "cursor",
     "standby",
     "suspend",

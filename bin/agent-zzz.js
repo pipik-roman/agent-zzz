@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 
 const pkg = require('../package.json');
-const { formatLocalTimestamp, sleepSystem, state } = require('../src/index');
+const { formatLocalTimestamp, sleepSystem, state, setup } = require('../src/index');
 
 /**
  * Parses CLI flags into an options object.
+ * Handles both root sleep execution and the `setup` / `install-skill` subcommand.
  * @param {string[]} argv
  * @returns {Object}
  */
 function parseArgs(argv = []) {
+    if (argv[0] === 'setup' || argv[0] === 'install-skill') {
+        return parseSetupArgs(argv.slice(1));
+    }
+
     const options = {
+        command: null,
         delay: 30,
         force: true,
         hibernate: false,
@@ -95,13 +101,88 @@ function parseArgs(argv = []) {
     return options;
 }
 
+/**
+ * Parses `agent-zzz setup [options]` arguments cleanly without falling through to sleep.
+ * @param {string[]} argv
+ * @returns {Object}
+ */
+function parseSetupArgs(argv = []) {
+    const options = {
+        command: 'setup',
+        client: null,
+        scope: 'global',
+        dryRun: false,
+        force: false,
+        uninstall: false,
+        json: false,
+        help: false,
+        unknownFlags: [],
+        errors: []
+    };
+
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        if (arg === '--help' || arg === '-h') {
+            options.help = true;
+        } else if (arg === '--dry-run') {
+            options.dryRun = true;
+        } else if (arg === '--force' || arg === '-f') {
+            options.force = true;
+        } else if (arg === '--uninstall' || arg === '--remove') {
+            options.uninstall = true;
+        } else if (arg === '--json') {
+            options.json = true;
+        } else if (arg === '--client') {
+            const next = argv[i + 1];
+            if (next && !next.startsWith('-')) {
+                options.client = next;
+                i++;
+            } else {
+                options.errors.push('Missing value for --client');
+            }
+        } else if (arg.startsWith('--client=')) {
+            const val = arg.slice('--client='.length).trim();
+            if (val) {
+                options.client = val;
+            } else {
+                options.errors.push('Missing value for --client');
+            }
+        } else if (arg === '--scope' || arg === '--scale') {
+            const next = argv[i + 1];
+            if (next && !next.startsWith('-')) {
+                options.scope = next.toLowerCase();
+                i++;
+            } else {
+                options.errors.push(`Missing value for ${arg}`);
+            }
+        } else if (arg.startsWith('--scope=') || arg.startsWith('--scale=')) {
+            const eqIdx = arg.indexOf('=');
+            const val = arg.slice(eqIdx + 1).trim().toLowerCase();
+            if (val) {
+                options.scope = val;
+            } else {
+                options.errors.push(`Missing value for ${arg.slice(0, eqIdx)}`);
+            }
+        } else {
+            options.unknownFlags.push(arg);
+            options.errors.push(`Unknown setup option: ${arg}`);
+        }
+    }
+
+    return options;
+}
+
 function showHelp() {
     console.log(`
-agent-zzz v${pkg.version} — Safe, agent-aware physical PC sleep and power controller
+agent-zzz v${pkg.version} — Safe, agent-aware computer sleep and power controller
 
 Usage:
   agent-zzz [options]
+  agent-zzz setup [options]
   npx agent-zzz [options]
+
+Subcommands:
+  setup, install-skill      Install or remove the /zzz skill in detected AI IDEs
 
 Options:
   --check-only, --check, -c Inspect active coding agent sessions & OS power locks without sleeping
@@ -120,9 +201,38 @@ Options:
 
 Examples:
   agent-zzz               # Audit active agents, wait until idle, 30s countdown, then sleep
+  agent-zzz setup         # Detect AI coding IDEs and install the /zzz skill interactively
   agent-zzz --check-only  # Check if any agent sessions or wake locks are active
   agent-zzz --now -d 5    # Skip agent wait and sleep after a 5-second countdown
   agent-zzz --dry-run     # Verify telemetry and power command without suspending
+`.trim());
+}
+
+function showSetupHelp() {
+    console.log(`
+agent-zzz setup — Install or manage the /zzz skill across AI coding IDEs
+
+Usage:
+  agent-zzz setup [options]
+  npx agent-zzz setup [options]
+
+Options:
+  --client <name|all>       Target client (antigravity, claude-code, copilot, agents, cursor, all)
+  --scope <global|workspace>
+                            Install into user home directory (default) or current workspace (--scale alias)
+  --dry-run                 Preview detected clients and target paths without writing files
+  --force, -f               Overwrite existing SKILL.md when local content differs
+  --uninstall, --remove     Remove installed zzz/SKILL.md from selected client(s)
+  --json                    Output setup results as structured JSON (requires --client)
+  --help, -h                Show this help message
+
+Examples:
+  agent-zzz setup                                   # Detect AI clients and choose interactively
+  agent-zzz setup --dry-run --client all            # Preview all detected global skill targets
+  agent-zzz setup --client claude-code              # Install globally into ~/.claude/skills/zzz/SKILL.md
+  agent-zzz setup --client copilot --scope workspace
+                                                    # Install into ./.github/skills/zzz/SKILL.md
+  agent-zzz setup --uninstall --client cursor       # Remove installed /zzz skill from Cursor
 `.trim());
 }
 
@@ -133,13 +243,47 @@ async function main() {
         for (const errMsg of options.errors) {
             console.error(`Error: ${errMsg}`);
         }
-        console.error('Run "agent-zzz --help" to see valid options.');
+        console.error(
+            options.command === 'setup'
+                ? 'Run "agent-zzz setup --help" to see valid setup options.'
+                : 'Run "agent-zzz --help" to see valid options.'
+        );
         process.exit(1);
     }
 
     if (options.help) {
-        showHelp();
+        if (options.command === 'setup') {
+            showSetupHelp();
+        } else {
+            showHelp();
+        }
         process.exit(0);
+    }
+
+    if (options.command === 'setup') {
+        const setupResult = await setup.runSetup({
+            client: options.client,
+            scope: options.scope,
+            dryRun: options.dryRun,
+            force: options.force,
+            uninstall: options.uninstall,
+            json: options.json
+        });
+
+        if (options.json) {
+            console.log(JSON.stringify(setupResult, null, 2));
+            process.exit(setupResult.success ? 0 : 1);
+        }
+
+        if (setupResult.message) {
+            if (setupResult.success) {
+                console.log(setupResult.message);
+            } else {
+                console.error(`Error: ${setupResult.message}`);
+            }
+        }
+
+        process.exit(setupResult.success ? 0 : 1);
     }
 
     if (options.version) {
@@ -194,4 +338,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { parseArgs };
+module.exports = { parseArgs, parseSetupArgs };

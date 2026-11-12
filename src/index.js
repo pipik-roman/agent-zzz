@@ -1,6 +1,7 @@
 const telemetry = require('./telemetry');
 const power = require('./power');
 const state = require('./state');
+const setup = require('./setup');
 
 /**
  * Formats a Date into local wall-clock timestamp (`HH:MM:SS` or `YYYY-MM-DD HH:MM:SS`).
@@ -378,5 +379,6 @@ module.exports = {
     sleepSystem,
     telemetry,
     power,
-    state
+    state,
+    setup
 };

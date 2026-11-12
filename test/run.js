@@ -3,10 +3,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { PassThrough } = require('node:stream');
 const { spawnSync } = require('node:child_process');
 
-const { parseArgs } = require('../bin/agent-zzz');
-const { formatLocalTimestamp, formatAuditReport, waitForIdle, runGraceCountdown, sleepSystem, telemetry, power, state } = require('../src/index');
+const { parseArgs, parseSetupArgs } = require('../bin/agent-zzz');
+const { formatLocalTimestamp, formatAuditReport, waitForIdle, runGraceCountdown, sleepSystem, telemetry, power, state, setup } = require('../src/index');
 
 test('parseArgs parses defaults and custom flags cleanly', () => {
     const defaults = parseArgs([]);
@@ -1047,5 +1048,302 @@ test('power resolves System32 executables explicitly and state latch ignores ANT
         else process.env.ANTIGRAVITY_APP_DATA_DIR = origAppData;
         if (origStateFile === undefined) delete process.env.AGENT_ZZZ_STATE_FILE;
         else process.env.AGENT_ZZZ_STATE_FILE = origStateFile;
+    }
+});
+
+test('parseArgs routes setup subcommand flags and fails fast on invalid setup options', () => {
+    const basic = parseArgs(['setup']);
+    assert.equal(basic.command, 'setup');
+    assert.equal(basic.scope, 'global');
+    assert.equal(basic.client, null);
+    assert.deepEqual(basic.errors, []);
+
+    const alias = parseArgs([
+        'install-skill',
+        '--client=copilot',
+        '--scale', 'workspace',
+        '--dry-run',
+        '-f',
+        '--uninstall',
+        '--json'
+    ]);
+    assert.equal(alias.command, 'setup');
+    assert.equal(alias.client, 'copilot');
+    assert.equal(alias.scope, 'workspace');
+    assert.equal(alias.dryRun, true);
+    assert.equal(alias.force, true);
+    assert.equal(alias.uninstall, true);
+    assert.equal(alias.json, true);
+    assert.deepEqual(alias.errors, []);
+
+    const badSetup = parseSetupArgs(['--client', '--hibernate', '--scope=']);
+    assert.ok(badSetup.errors.length >= 3);
+    assert.ok(badSetup.unknownFlags.includes('--hibernate'));
+
+    const missingSubcommand = parseArgs(['--client', 'antigravity']);
+    assert.ok(missingSubcommand.unknownFlags.includes('--client'));
+    assert.ok(missingSubcommand.errors.length >= 1);
+});
+
+test('setup discovers global and workspace AI IDEs and deduplicates shared .agents paths', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-setup-disc-'));
+    const homeDir = path.join(tmpRoot, 'home');
+    const cwd = path.join(tmpRoot, 'repo');
+    const appData = path.join(tmpRoot, 'AppData', 'Roaming');
+
+    try {
+        fs.mkdirSync(path.join(homeDir, '.gemini', 'antigravity'), { recursive: true });
+        fs.writeFileSync(path.join(homeDir, '.claude.json'), '{}');
+        fs.mkdirSync(path.join(appData, 'Code', 'User', 'globalStorage', 'github.copilot-chat'), { recursive: true });
+        fs.mkdirSync(path.join(cwd, '.agents'), { recursive: true });
+        fs.mkdirSync(path.join(cwd, '.github'), { recursive: true });
+
+        assert.equal(
+            setup.resolveVSCodeCopilotStorageDir('/home/u', 'linux', {}),
+            path.join('/home/u', '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat')
+        );
+        assert.equal(
+            setup.resolveVSCodeCopilotStorageDir('/Users/u', 'darwin', {}),
+            path.join('/Users/u', 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'github.copilot-chat')
+        );
+
+        assert.equal(setup.resolveClientArg('agy').client.id, 'antigravity');
+        assert.equal(setup.resolveClientArg('claude').client.id, 'claude-code');
+        assert.equal(setup.resolveClientArg('vscode').client.id, 'copilot');
+        assert.equal(setup.resolveClientArg('all').mode, 'all');
+        assert.equal(setup.resolveClientArg('nope').mode, 'unknown');
+
+        const globalTargets = setup.discoverTargets({
+            scope: 'global',
+            homeDir,
+            cwd,
+            platform: 'win32',
+            env: { APPDATA: appData }
+        });
+        assert.deepEqual(
+            globalTargets.map((t) => t.client.id),
+            ['antigravity', 'claude-code', 'copilot']
+        );
+        assert.equal(globalTargets[0].displayPath, '~/.gemini/config/skills/zzz/SKILL.md');
+        assert.equal(globalTargets[1].displayPath, '~/.claude/skills/zzz/SKILL.md');
+        assert.equal(globalTargets[2].displayPath, '~/.copilot/skills/zzz/SKILL.md');
+
+        const workspaceTargets = setup.discoverTargets({ scope: 'workspace', homeDir, cwd });
+        // Antigravity & Universal both target .agents/skills/zzz/SKILL.md -> deduplicated to 1 entry
+        assert.deepEqual(
+            workspaceTargets.map((t) => t.client.id),
+            ['antigravity', 'copilot']
+        );
+        assert.equal(workspaceTargets[0].displayPath, './.agents/skills/zzz/SKILL.md');
+        assert.equal(workspaceTargets[1].displayPath, './.github/skills/zzz/SKILL.md');
+
+        // Menu parser validation
+        assert.equal(setup.parseMenuSelection('', globalTargets).action, 'quit');
+        assert.equal(setup.parseMenuSelection('Q', globalTargets).action, 'quit');
+        assert.equal(setup.parseMenuSelection('a', globalTargets).targets.length, 3);
+        assert.deepEqual(
+            setup.parseMenuSelection('1, 3, 1', globalTargets).targets.map((t) => t.client.id),
+            ['antigravity', 'copilot']
+        );
+        assert.equal(setup.parseMenuSelection('0', globalTargets).action, 'invalid');
+        assert.equal(setup.parseMenuSelection('9', globalTargets).action, 'invalid');
+        assert.equal(setup.parseMenuSelection('abc', globalTargets).action, 'invalid');
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('runSetup installs, protects modified skills, handles interactive prompts, and uninstalls cleanly', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-setup-run-'));
+    const homeDir = path.join(tmpRoot, 'home');
+    const cwd = path.join(tmpRoot, 'workspace');
+    const sourceContent = fs.readFileSync(setup.DEFAULT_SKILL_SOURCE, 'utf8');
+
+    try {
+        fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+        fs.mkdirSync(path.join(homeDir, '.copilot'), { recursive: true });
+        fs.mkdirSync(cwd, { recursive: true });
+
+        const makeStreams = (inputData = '') => {
+            const stdin = new PassThrough();
+            const chunks = [];
+            const stdout = { write: (s) => chunks.push(String(s)) };
+            if (inputData !== null) stdin.end(inputData);
+            return { stdin, stdout, output: () => chunks.join('') };
+        };
+
+        // 1. Dry run must not write any files
+        const dryRes = await setup.runSetup({
+            client: 'claude-code',
+            scope: 'global',
+            homeDir,
+            cwd,
+            dryRun: true,
+            logFn: () => {}
+        });
+        assert.equal(dryRes.success, true);
+        assert.equal(dryRes.results[0].action, 'dry_run_install');
+        const claudeSkillPath = path.join(homeDir, '.claude', 'skills', 'zzz', 'SKILL.md');
+        assert.equal(fs.existsSync(claudeSkillPath), false);
+
+        // 2. Non-TTY interactive setup must reject cleanly
+        const nonTtyRes = await setup.runSetup({
+            homeDir,
+            cwd,
+            isTTY: false,
+            stdin: new PassThrough(),
+            stdout: { write: () => {} }
+        });
+        assert.equal(nonTtyRes.success, false);
+        assert.match(nonTtyRes.message, /--client/);
+
+        // 3. Interactive --json must reject without writing prompt to stdout
+        const jsonInteractive = await setup.runSetup({
+            homeDir,
+            cwd,
+            isTTY: true,
+            json: true
+        });
+        assert.equal(jsonInteractive.success, false);
+        assert.match(jsonInteractive.message, /--json/);
+
+        // 4. Interactive Q quits without touching files
+        const quitIo = makeStreams('Q\n');
+        const quitRes = await setup.runSetup({
+            homeDir,
+            cwd,
+            isTTY: true,
+            stdin: quitIo.stdin,
+            stdout: quitIo.stdout
+        });
+        assert.equal(quitRes.success, true);
+        assert.equal(quitRes.cancelled, true);
+
+        // 5. Scripted workspace install creates ./.github/skills/zzz/SKILL.md and reports up_to_date on repeat
+        const wsInstall = await setup.runSetup({
+            client: 'copilot',
+            scope: 'workspace',
+            homeDir,
+            cwd,
+            logFn: () => {}
+        });
+        assert.equal(wsInstall.success, true);
+        assert.equal(wsInstall.results[0].action, 'installed');
+        const wsSkillPath = path.join(cwd, '.github', 'skills', 'zzz', 'SKILL.md');
+        assert.equal(fs.readFileSync(wsSkillPath, 'utf8'), sourceContent);
+
+        const wsRepeat = await setup.runSetup({
+            client: 'copilot',
+            scope: 'workspace',
+            homeDir,
+            cwd,
+            logFn: () => {}
+        });
+        assert.equal(wsRepeat.success, true);
+        assert.equal(wsRepeat.results[0].action, 'up_to_date');
+
+        // 6. Modified existing skill refuses overwrite in scripted mode without --force, succeeds with --force
+        fs.writeFileSync(wsSkillPath, '# Custom edited skill\n', 'utf8');
+        const conflictNoForce = await setup.runSetup({
+            client: 'copilot',
+            scope: 'workspace',
+            homeDir,
+            cwd,
+            logFn: () => {}
+        });
+        assert.equal(conflictNoForce.success, false);
+        assert.equal(conflictNoForce.results[0].reason, 'exists_differs');
+        assert.equal(fs.readFileSync(wsSkillPath, 'utf8'), '# Custom edited skill\n');
+
+        // Interactive decline ('1\nn\n') keeps custom file; interactive approve ('1\ny\n') overwrites atomically
+        fs.mkdirSync(path.join(cwd, '.github'), { recursive: true });
+        const declineIo = makeStreams('1\nn\n');
+        const declineRes = await setup.runSetup({
+            scope: 'workspace',
+            homeDir,
+            cwd,
+            isTTY: true,
+            stdin: declineIo.stdin,
+            stdout: declineIo.stdout
+        });
+        assert.equal(declineRes.success, true);
+        assert.equal(declineRes.results[0].reason, 'overwrite_declined');
+        assert.equal(fs.readFileSync(wsSkillPath, 'utf8'), '# Custom edited skill\n');
+
+        const approveIo = makeStreams('1\ny\n');
+        const approveRes = await setup.runSetup({
+            scope: 'workspace',
+            homeDir,
+            cwd,
+            isTTY: true,
+            stdin: approveIo.stdin,
+            stdout: approveIo.stdout
+        });
+        assert.equal(approveRes.success, true);
+        assert.equal(approveRes.results[0].action, 'updated');
+        assert.equal(fs.readFileSync(wsSkillPath, 'utf8'), sourceContent);
+
+        // Scripted --force overwrite check on global claude-code
+        fs.mkdirSync(path.dirname(claudeSkillPath), { recursive: true });
+        fs.writeFileSync(claudeSkillPath, 'old', 'utf8');
+        const forceRes = await setup.runSetup({
+            client: 'claude-code',
+            scope: 'global',
+            homeDir,
+            cwd,
+            force: true,
+            logFn: () => {}
+        });
+        assert.equal(forceRes.success, true);
+        assert.equal(forceRes.results[0].action, 'updated');
+        assert.equal(fs.readFileSync(claudeSkillPath, 'utf8'), sourceContent);
+
+        // 7. Uninstall removes file and empty zzz/ directory
+        const uninstallRes = await setup.runSetup({
+            client: 'claude-code',
+            scope: 'global',
+            homeDir,
+            cwd,
+            uninstall: true,
+            logFn: () => {}
+        });
+        assert.equal(uninstallRes.success, true);
+        assert.equal(uninstallRes.results[0].action, 'uninstalled');
+        assert.equal(fs.existsSync(claudeSkillPath), false);
+        assert.equal(fs.existsSync(path.dirname(claudeSkillPath)), false);
+        assert.equal(fs.existsSync(path.join(homeDir, '.claude', 'skills')), true);
+    } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test('CLI executes setup subcommand end-to-end (--help, --dry-run --json, invalid flags)', () => {
+    const cliPath = path.join(__dirname, '..', 'bin', 'agent-zzz.js');
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zzz-cli-setup-'));
+
+    try {
+        const helpProc = spawnSync(process.execPath, [cliPath, 'setup', '--help'], { encoding: 'utf8' });
+        assert.equal(helpProc.status, 0);
+        assert.match(helpProc.stdout, /agent-zzz setup/);
+        assert.match(helpProc.stdout, /--client/);
+
+        const badProc = spawnSync(process.execPath, [cliPath, 'setup', '--unknown-setup-flag'], { encoding: 'utf8' });
+        assert.equal(badProc.status, 1);
+        assert.match(badProc.stderr, /Unknown setup option: --unknown-setup-flag/);
+
+        const dryJsonProc = spawnSync(
+            process.execPath,
+            [cliPath, 'setup', '--client', 'copilot', '--scope', 'workspace', '--dry-run', '--json'],
+            { cwd: tmpCwd, encoding: 'utf8' }
+        );
+        assert.equal(dryJsonProc.status, 0);
+        const payload = JSON.parse(dryJsonProc.stdout);
+        assert.equal(payload.success, true);
+        assert.equal(payload.results.length, 1);
+        assert.equal(payload.results[0].client, 'copilot');
+        assert.equal(payload.results[0].action, 'dry_run_install');
+        assert.equal(fs.existsSync(path.join(tmpCwd, '.github')), false);
+    } finally {
+        fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
 });

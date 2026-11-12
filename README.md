@@ -1,110 +1,159 @@
-# 💤 `agent-zzz`
+```text
+  ─────────────────────────────────────────────────────────────
+        ▄▄██▀       ╭───────────────────╮               *
+       ███▀         │  > agents: 0 idle │         .
+      ████          │    [ - _ - ]      │                  *
+       ███▄         ╰─────────┬─────────╯              ▀▀▀██
+        ▀▀██▄             ╭───┴───╮            ▄▄▄▄▄    ▄█▀
+                                                 ▄█▀   ▀▀▀▀▀
+     ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀     ▀▀▀██   ▄██▄▄
+     █▀▀▀█ █  ▀█ █▀▀▀  █ ▀▄█   █   ▀▀▀  ▄█▀
+     ▀   ▀  ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀       ▀▀▀▀▀
 
-**Agent-aware physical PC sleep and hardware power management for autonomous coding agents.**
+      agent-aware computer sleep  ·  wait · count · suspend
+  ─────────────────────────────────────────────────────────────
+```
 
-> *Your AI agents run long tasks while you step away. Leaving a 200W workstation idling for hours afterward wastes power and hardware. Blind sleep commands kill active agents or crash with Windows ABI bugs. `agent-zzz` puts your machine to sleep **only after all active coding agents finish**.*
+<div align="center">
+
+**Put your computer to sleep—only after every coding agent finishes.**
+
+[![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?style=flat-square)](docs/cli-and-setup.md)
+[![Node.js >=18](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square)](package.json)
+[![Dependencies: Zero](https://img.shields.io/badge/Dependencies-Zero-success?style=flat-square)](package.json)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+
+</div>
+
+> **Current POC (v0.1)**: Verified telemetry on **Windows 10/11 + Google Antigravity**. **Claude Code**, **GitHub Copilot** (VS Code & CLI), and **Cursor** install `/zzz` via `agent-zzz setup`, but still need real-world harness testing and telemetry—please try them out and [report issues](https://github.com/pipik-roman/agent-zzz/issues).
+
+```text
+$ npx agent-zzz
+
+[2026-11-09 23:40:12] Detected 1 active agent session(s) in progress:
+  - [antigravity:71f654cf] "Run integration suite" (step 149, running background task "task-149", active 4s ago @ 23:40:08)
+Waiting for active turns and tools to complete before sleeping... (Pass --now to bypass)
+
+[23:40:17] [+5s] Still waiting on: 71f654cf (step 150, running background task "task-149", 2s ago)
+[2026-11-09 23:40:42] All external agent sessions have settled into idle.
+
+[2026-11-09 23:40:42] System will enter sleep in 30 second(s). Press Ctrl+C to abort.
+  [23:40:52] ... 20s remaining before sleep
+  [23:41:02] ... 10s remaining before sleep
+[2026-11-09 23:41:12] Triggering OS sleep now...
+```
 
 ---
 
-## ⚡ Quick Start
+## Why `agent-zzz` Exists
 
-> **Current POC Scope (v0.1)**: Supports **Windows 10/11** and **Google Antigravity** telemetry. Cross-platform support (macOS, Linux) and Claude Code / Cursor adapters arrive in v0.2.
+I run coding agents locally on my workstation and don't want the machine staying on through the night. Because I often trigger sleep via remote control after stepping away, I wrote a small script to make sure the machine actually sleeps—without getting dropped by sandboxing, low privileges, or Windows API quirks, and without cutting off active agent sessions that are still working (while ignoring sessions merely waiting on my input).
 
-Run a non-mutating check of active agent sessions and OS sleep states:
+Unlike `asyncio.sleep` timers or LLM memory "dream cycles" that only pause software, `agent-zzz` puts the physical hardware to sleep after verifying every concurrent session has settled.
+
+| Approach | Sees Sibling Agents | Avoids Self-Deadlock | Windows ABI Safe | Zero Daemon |
+| :--- | :---: | :---: | :---: | :---: |
+| **`rundll32.exe powrprof.dll`** | ❌ Blind | ❌ No | ❌ Broken | ✅ CLI |
+| **`asyncio.sleep` / Dream MCPs** | ❌ Software wait only | N/A | ❌ Host stays awake | ❌ Server |
+| **Generic Shell Scripts** | ❌ Blind | ❌ Deadlocks caller | ⚠️ Fragile | ✅ Script |
+| **`agent-zzz`** | **✅ Audits live sessions** | **✅ Automatic** | **✅ Native CLR call** | **✅ CLI + Skill** |
+
+> See [Engineering Issues Solved](docs/engineering-issues.md) for the real-world Windows ABI, sandbox `EPERM`, background-task handoff, cancellation, and mid-countdown wake-up issues uncovered during manual testing.
+
+---
+
+## 30-Second Quickstart
+
+Install the `/zzz` skill interactively into detected AI IDEs (Antigravity, Claude Code, GitHub Copilot, Cursor, `.agents`):
+
 ```bash
-npx agent-zzz --check-only
+npx agent-zzz setup
 ```
 
-Safely wait for concurrent agents to finish, count down 30 seconds, and suspend the PC:
+Inspect active sessions and OS sleep locks without changing power state:
+
+```bash
+npx agent-zzz --check
+```
+
+Wait for concurrent agents to finish, count down 30 seconds, and sleep:
+
 ```bash
 npx agent-zzz
 ```
 
-Install globally or link the `/zzz` skill:
+Install the CLI globally to unlock the short `zzz` alias (`zzz`, `zzz --check`, `zzz --now`):
+
 ```bash
 npm install -g agent-zzz
 ```
 
 ---
 
-## 🤔 Why `agent-zzz` Exists
+## Common Commands
 
-Most developer tools with "sleep" in their name are either **memory consolidation loops** ("dream cycles") or **in-process delay timers** (`asyncio.sleep`) that leave your workstation running at full wattage. Generic desktop control scripts run blind shell commands that silently fail or wreck concurrent coding turns.
-
-| Method / Tool | Multi-Agent Awareness | Self-Deadlock Exclusion | Windows ABI Safety | Zero Background Daemon |
-| :--- | :---: | :---: | :---: | :---: |
-| **`rundll32.exe powrprof.dll`** | ❌ Blind | ❌ None | ❌ Broken (Triggers S4/drops) | ✅ CLI |
-| **Generic MCP Bridges** | ❌ Blind | ❌ None | ❌ Shell wrappers | ❌ 24/7 Server |
-| **`asyncio.sleep` MCPs** | ❌ Software wait only | N/A | ❌ Does not sleep host | ❌ 24/7 Server |
-| **`agent-zzz`** | **✅ Audits active sessions** | **✅ Automatic** | **✅ Native CLR invocation** | **✅ Lean CLI + Skill** |
-
-### Three Problems Solved Out of the Box
-1. **The Self-Deadlock Hazard**: When an agent asks "are any agents running?", naive scripts scan disk transcripts, discover the invoking conversation itself is active, and wait forever for themselves to finish. `agent-zzz` inspects runtime IDs (`ANTIGRAVITY_CONVERSATION_ID`, `--exclude-session`) for deterministic self-exclusion.
-2. **The Windows `rundll32` ABI Trap**: Calling `rundll32.exe powrprof.dll,SetSuspendState 0,1,0` passes an `HWND` pointer instead of a boolean to `SetSuspendState`, forcing unwanted Hibernation or failing silently when hibernation is disabled. `agent-zzz` uses hardened WinForms CLR calls (`[System.Windows.Forms.Application]::SetSuspendState`).
-3. **Aborted Streams & Corrupted Worktrees**: Instead of instantly severing TCP sockets when an agent wraps up, `agent-zzz` observes a 30-second live-monitored countdown and writes a durable state latch (`~/.gemini/agent-zzz/power-pause.json`) so agents recognize an intentional sleep upon wake-up.
-
----
-
-## 🔒 Security & Safety
-
-- **Zero Runtime Dependencies & Zero Install Scripts**: Ships pure Node.js standard library modules only, reducing supply-chain risk when run via `npx agent-zzz`.
-- **Fail-Closed Sandbox Protection**: If filesystem sandboxing returns `EPERM`/`EACCES` on sibling agent transcripts, `--check` and default sleep abort cleanly rather than suspending blindly.
-- **Hardened Windows Binary Resolution**: Resolves `powercfg.exe` and `powershell.exe` explicitly from `%SystemRoot%\System32` (`shell: false`) to prevent current-directory binary planting in untrusted repositories.
-- **Prompt-Injection Defense**: Keep human approval enabled when an agent requests `--now` or `--delay 0`; avoid globally auto-approving `--now` shortcuts across untrusted workspaces.
-- See [SECURITY.md](SECURITY.md) for vulnerability reporting and full threat-model details.
-
----
-
-## 🛠️ CLI Reference
-
-```text
-Usage:
-  agent-zzz [options]
-
-Options:
-  --check-only, --check, -c Inspect active coding agent sessions & OS power locks without sleeping
-  --json                  Output audit telemetry as structured JSON
-  --now, --skip-wait      Sleep immediately without waiting for concurrent agent sessions
-  --delay, -d <seconds>   Abortable grace countdown before sleeping (default: 30)
-  --timeout, -t <minutes> Maximum minutes to wait for active agent sessions (default: 30)
-  --poll, -p <seconds>    Polling interval while waiting for idle state (default: 5)
-  --hibernate             Hibernate (S4) instead of Standby/Sleep (S3/S0ix)
-  --no-force              Allow OS applications/drivers to veto sleep via power locks
-  --exclude-session <id>  Explicitly exclude a conversation/session ID from concurrency audit
-  --status                Display the last pre-sleep state latch marker (power-pause.json)
-  --dry-run               Simulate audit and display the exact OS suspend command without sleeping
-  --version, -v           Show version number
-  --help, -h              Show this help message
+```bash
+agent-zzz setup           # Detect AI IDEs and install /zzz interactively
+agent-zzz --check         # Audit active agent sessions & OS wake locks
+agent-zzz                 # Wait for idle, run live 30s countdown, then sleep
+agent-zzz --now --delay 5 # Skip waiting and sleep after 5 seconds
+agent-zzz --hibernate     # Hibernate (S4) instead of Standby (S3/S0ix)
+agent-zzz --dry-run       # Preview audit & power command without sleeping
 ```
 
----
-
-## 🤖 Installing the `/zzz` Agent Skill
-
-`agent-zzz` ships a standardized `SKILL.md` manifest (`skills/zzz/SKILL.md`). Copy or symlink it into your agent harness skill directory to enable natural-language triggers (*"put my PC to sleep when done"*) and the `/zzz` slash command:
-
-- **Google Antigravity (Global)**: `~/.gemini/config/skills/zzz/SKILL.md`
-- **Workspace-scoped (Universal)**: `.agents/skills/zzz/SKILL.md`
-- **Claude Code / Cursor**: `.claude/skills/zzz/SKILL.md` or `.cursor/skills/zzz/SKILL.md`
+> Full CLI flags, `setup` options (`--client`, `--scope`, `--dry-run`, `--uninstall`), sandbox rules, and `power-pause.json` resume markers live in [CLI & Setup Guide](docs/cli-and-setup.md).
 
 ---
 
-## 🗺️ Roadmap
+## First-Time Agentic Setup & Warm-Up
 
-- **v0.1 (Current POC)**:
-  - Zero-dependency Node.js CLI
-  - Google Antigravity transcript telemetry & deterministic self-exclusion
-  - Hardened Windows PowerShell CLR suspend + `powercfg` audits
-  - Durable `power-pause.json` latch & abortable 30s countdown
-  - `/zzz` `SKILL.md` bundle
-- **v0.2+ (Upcoming)**:
-  - Multi-agent adapters: **Claude Code** (`~/.claude/projects/`), **Cursor** (`~/.cursor/`), and **Charm Crush** (`~/.config/crush/`)
-  - Cross-platform OS dispatchers: **macOS** (`pmset sleepnow`, IOKit assertions) & **Linux** (`systemd-logind` D-Bus)
-  - Laptop hardware guardrails: battery discharge protection (< 15% auto-hibernates) & thermal fan cooldown
-  - Alternative zero-runtime compiled backend (Go/Rust)
+Prevent unattended sleep runs from stalling on IDE permission prompts or sandbox blocks:
+
+1. **Install globally** so agents call `agent-zzz` directly without `npx` filters:
+
+   ```bash
+   npm install -g agent-zzz
+   ```
+
+2. **Install the skill outside any sandbox** (writes to `~/.gemini/config/skills/`, `~/.claude/skills/`, `~/.copilot/skills/`, etc.):
+
+   ```bash
+   agent-zzz setup
+   ```
+
+3. **Run an immediate warm-up while at your keyboard**:
+   - Ask your agent: *"Warm up `/zzz`: run `agent-zzz --check` outside the sandbox, then start `agent-zzz` in the background and cancel it immediately during the 30s countdown."*
+   - Choose **Always Allow** on both prompts so you save unsandboxed permissions for future runs.
+
+> **Tip — Start `/zzz` in a Separate Chat:** Avoid queuing `/zzz` onto a busy turn where prompts wait behind long tasks. Open a lightweight second chat and run `/zzz` right away—it checks wake locks while you watch and puts your machine to sleep as soon as the primary session finishes.
 
 ---
 
-## 📄 License
+## Built-In Safety
 
-MIT © [Roman Pipík](https://github.com/pipik-roman) and contributors.
+- **100% Offline & Local-Only**: Makes zero network calls and never uploads, stores, or processes conversation content—transcript checks run strictly in local memory to detect active tool and task states.
+- **Zero Dependencies**: Uses only Node.js built-in modules. No third-party packages or install scripts.
+- **Live Countdown Watch**: Polls sibling sessions every 2 seconds during the 30-second countdown and pauses automatically if work resumes.
+- **Fail-Closed Sandboxing**: Aborts instead of sleeping blindly if sandbox permissions block sibling transcript reads (`EPERM`/`EACCES`).
+- **Hardened Windows Binaries**: Resolves `powershell.exe` and `powercfg.exe` from `%SystemRoot%\System32` (`shell: false`). See [SECURITY.md](SECURITY.md).
+
+---
+
+## Roadmap
+
+### High Priority — Primary Agents & OS Support
+- [ ] Session telemetry for **Claude Code** and **GitHub Copilot** (VS Code & Copilot CLI)
+- [ ] Cross-platform power dispatchers for **macOS** (`pmset sleepnow`) and **Linux** (`systemd-logind` D-Bus)
+
+### Medium Priority — Laptop & Build Safety
+- [ ] **Safe low-battery fallback**: when invoked on a laptop below 15% battery, automatically use Hibernate (S4) instead of Standby (S3) so RAM cannot drain overnight
+- [ ] **Post-build thermal cooldown**: brief fan spin-down check after heavy builds before cutting power
+
+### Lower Priority — Package Managers
+- [ ] Native OS package installs via **Homebrew**, **Winget**, and **Scoop**
+
+---
+
+## License
+
+MIT © [Roman Pipík](https://github.com/pipik-roman) and contributors. See [LICENSE](LICENSE).
